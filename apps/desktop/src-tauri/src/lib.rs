@@ -180,25 +180,37 @@ fn dns_info() -> Result<DnsInfo, String> {
     let mut current_server = None;
     let mut servers = Vec::new();
 
+    let mut current_interface = None;
     let mut dns_scope_active = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
 
         if trimmed.starts_with("Link ") {
+            current_interface = line
+                .split_once('(')
+                .and_then(|(_, value)| value.split_once(')'))
+                .map(|(name, _)| name.trim().to_string());
+
             dns_scope_active = false;
-            interface_name = None;
+            continue;
         }
 
-        if trimmed.starts_with("Link ") && line.contains("wlp2s0") {
-            interface_name = Some("wlp2s0".to_string());
-            dns_scope_active = true;
+        if trimmed.starts_with("Current Scopes:") {
+            dns_scope_active = trimmed.contains("DNS");
+
+            if dns_scope_active && interface_name.is_none() {
+                interface_name = current_interface.clone();
+            }
+
+            continue;
         }
 
         if dns_scope_active && trimmed.starts_with("Current DNS Server:") {
             current_server = trimmed
                 .split_once(':')
                 .map(|(_, value)| value.trim().to_string());
+            continue;
         }
 
         if dns_scope_active && trimmed.starts_with("DNS Servers:") {
