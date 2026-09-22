@@ -23,6 +23,14 @@ struct NetworkRouteInfo {
 }
 
 #[derive(Debug, Serialize)]
+struct NetworkNeighborInfo {
+    ip_address: String,
+    mac_address: Option<String>,
+    interface_name: String,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DnsInfo {
     interface_name: Option<String>,
     current_server: Option<String>,
@@ -164,6 +172,85 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
 }
 
 #[tauri::command]
+async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
+    let (connection, handle, _) =
+        new_connection().map_err(|error| error.to_string())?;
+
+    tokio::spawn(connection);
+
+    let mut neighbors = handle.neighbours().get().execute();
+    let mut result = Vec::new();
+
+    while let Some(neighbor) = neighbors
+        .try_next()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+
+        let mut ip_address = None;
+        let mut mac_address = None;
+
+        for attribute in neighbor.attributes {
+            match attribute {
+                rtnetlink::packet_route::neighbour::NeighbourAttribute::Destination(address) => {
+                    ip_address = Some(match address {
+                rtnetlink::packet_route::neighbour::NeighbourAddress::Inet(address) => {
+                    address.to_string()
+                }
+                rtnetlink::packet_route::neighbour::NeighbourAddress::Inet6(address) => {
+                    address.to_string()
+                }
+                _ => continue,
+            });
+                }
+                rtnetlink::packet_route::neighbour::NeighbourAttribute::LinkLayerAddress(address) => {
+                    mac_address = Some(
+                        address
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(":"),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let Some(ip_address) = ip_address else {
+            continue;
+        };
+
+        let interface_name = std::fs::read_dir("/sys/class/net")
+            .ok()
+            .and_then(|entries| {
+                entries.flatten().find_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let index_path = entry.path().join("ifindex");
+                    let value = std::fs::read_to_string(index_path).ok()?;
+
+                    if value.trim().parse::<u32>().ok()? == neighbor.header.ifindex {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| "—".to_string());
+
+        let state = format!("{:?}", neighbor.header.state);
+
+        result.push(NetworkNeighborInfo {
+            ip_address,
+            mac_address,
+            interface_name,
+            state,
+        });
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
 fn dns_info() -> Result<DnsInfo, String> {
     let output = std::process::Command::new("resolvectl")
         .arg("status")
@@ -234,6 +321,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             network_interfaces,
             network_routes,
+            network_neighbors,
             dns_info
 ])
         .run(tauri::generate_context!())

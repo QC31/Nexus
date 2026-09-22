@@ -17,6 +17,13 @@ interface NetworkRouteInfo {
   metric: number | null;
 }
 
+interface NetworkNeighborInfo {
+  ip_address: string;
+  mac_address: string | null;
+  interface_name: string;
+  state: string;
+}
+
 interface DnsInfo {
   interface_name: string | null;
   current_server: string | null;
@@ -28,6 +35,8 @@ export function NetToolBoxPage() {
   const [error, setError] = useState("");
   const [routes, setRoutes] = useState<NetworkRouteInfo[]>([]);
   const [dnsInfo, setDnsInfo] = useState<DnsInfo | null>(null);
+  const [neighbors, setNeighbors] = useState<NetworkNeighborInfo[]>([]);
+  console.log("NEXUS neighbors:", neighbors);
 
   useEffect(() => {
     invoke<NetworkInterfaceInfo[]>("network_interfaces")
@@ -40,6 +49,12 @@ export function NetToolBoxPage() {
         .then(setRoutes)
         .catch((error) => {
         console.error("Failed to load network routes:", error);
+  });
+
+      invoke<NetworkNeighborInfo[]>("network_neighbors")
+        .then(setNeighbors)
+        .catch((error) => {
+        console.error("Failed to load network neighbors:", error);
   });
 
       invoke<DnsInfo>("dns_info")
@@ -217,6 +232,60 @@ export function NetToolBoxPage() {
     </p>
   )}
 </div>
+
+<div className="mt-6 border-t border-[#3B171D] pt-5">
+  <p className="text-xs text-[#9D8589]">NETWORK NEIGHBORS</p>
+
+{neighbors.length > 0 ? (
+  <div className="mt-4 space-y-2">
+    {neighbors.map((neighbor) => (
+  <div
+    key={`${neighbor.ip_address}-${neighbor.mac_address ?? "unknown"}`}
+    className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+  >
+    <div className="grid grid-cols-1 gap-4 font-mono text-xs sm:grid-cols-2">
+      <div className="min-w-0">
+        <p className="text-[10px] text-[#9D8589]">IP ADDRESS</p>
+        <p className="mt-1 break-all">{neighbor.ip_address}</p>
+      </div>
+
+      <div className="min-w-0">
+        <p className="text-[10px] text-[#9D8589]">MAC ADDRESS</p>
+        <p className="mt-1 break-all text-[#9D8589]">
+          {neighbor.mac_address ?? "—"}
+        </p>
+      </div>
+
+      <div className="min-w-0">
+        <p className="text-[10px] text-[#9D8589]">INTERFACE</p>
+        <p className="mt-1">{neighbor.interface_name}</p>
+      </div>
+
+      <div className="min-w-0">
+        <p className="text-[10px] text-[#9D8589]">STATE</p>
+        <p className="mt-1">{neighbor.state}</p>
+      </div>
+    </div>
+  </div>
+))}
+  </div>
+) : (
+  <p className="mt-4 text-sm text-[#9D8589]">
+    No network neighbors detected.
+  </p>
+)}
+
+
+
+
+
+
+</div>
+
+
+
+
+
 
 </div>
         </Card>
