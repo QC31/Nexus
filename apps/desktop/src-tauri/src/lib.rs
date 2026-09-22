@@ -37,6 +37,137 @@ struct DnsInfo {
     servers: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct PingResult {
+    target: String,
+    sent: u32,
+    received: u32,
+    packet_loss: f64,
+    min_ms: Option<f64>,
+    avg_ms: Option<f64>,
+    max_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct TcpCheckResult {
+    target: String,
+    port: u16,
+    open: bool,
+    connect_time_ms: Option<f64>,
+}
+
+#[tauri::command]
+fn ping_host(target: String) -> Result<PingResult, String> {
+    let output = std::process::Command::new("ping")
+        .args(["-c", "4", "-W", "2", &target])
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let summary = stdout
+        .lines()
+        .find(|line| line.contains("packets transmitted"))
+        .ok_or_else(|| "Unable to parse ping packet statistics".to_string())?;
+
+    let rtt = stdout
+        .lines()
+        .find(|line| line.contains("min/avg/max"));
+
+    let sent = summary
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| "Unable to parse packets sent".to_string())?;
+
+    let received = summary
+        .split_whitespace()
+        .nth(3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| "Unable to parse packets received".to_string())?;
+
+    let packet_loss = summary
+        .split("% packet loss")
+        .next()
+        .and_then(|value| value.split_whitespace().last())
+        .and_then(|value| value.parse::<f64>().ok())
+        .ok_or_else(|| "Unable to parse packet loss".to_string())?;
+
+        let (min_ms, avg_ms, max_ms) = if let Some(rtt) = rtt {
+    let rtt_values = rtt
+        .split('=')
+        .nth(1)
+        .and_then(|value| value.trim().split_whitespace().next());
+
+    if let Some(rtt_values) = rtt_values {
+        let mut values = rtt_values.split('/');
+
+        let min_ms = values
+            .next()
+            .and_then(|value| value.parse::<f64>().ok());
+
+        let avg_ms = values
+            .next()
+            .and_then(|value| value.parse::<f64>().ok());
+
+        let max_ms = values
+            .next()
+            .and_then(|value| value.parse::<f64>().ok());
+
+        (min_ms, avg_ms, max_ms)
+    } else {
+        (None, None, None)
+    }
+} else {
+    (None, None, None)
+};
+
+    Ok(PingResult {
+        target,
+        sent,
+        received,
+        packet_loss,
+        min_ms,
+        avg_ms,
+        max_ms,
+    })
+}
+
+#[tauri::command]
+fn tcp_check(target: String, port: u16) -> Result<TcpCheckResult, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::{Duration, Instant};
+
+    let address = format!("{target}:{port}");
+
+    let socket_address = address
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?
+        .next()
+        .ok_or_else(|| "Unable to resolve target".to_string())?;
+
+    let start = Instant::now();
+
+    let result = TcpStream::connect_timeout(&socket_address, Duration::from_secs(3));
+
+    let connect_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    match result {
+        Ok(_) => Ok(TcpCheckResult {
+            target,
+            port,
+            open: true,
+            connect_time_ms: Some(connect_time_ms),
+        }),
+        Err(_) => Ok(TcpCheckResult {
+            target,
+            port,
+            open: false,
+            connect_time_ms: None,
+        }),
+    }
+}
+
 fn is_interface_up(name: &str) -> bool {
     std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
         .map(|state| state.trim() == "up")
@@ -322,8 +453,50 @@ pub fn run() {
             network_interfaces,
             network_routes,
             network_neighbors,
-            dns_info
+            dns_info,
+            ping_host,
+            tcp_check
 ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ping_localhost() {
+        let result = ping_host("127.0.0.1".to_string()).expect("ping failed");
+
+        assert_eq!(result.target, "127.0.0.1");
+        assert_eq!(result.sent, 4);
+        assert_eq!(result.received, 4);
+        assert_eq!(result.packet_loss, 0.0);
+
+        assert!(result.min_ms.is_some());
+        assert!(result.avg_ms.is_some());
+        assert!(result.max_ms.is_some());
+    }
+
+#[test]
+    fn tcp_check_local_ssh() {
+        let result = tcp_check("127.0.0.1".to_string(), 22).expect("tcp check failed");
+
+        assert_eq!(result.target, "127.0.0.1");
+        assert_eq!(result.port, 22);
+        assert!(result.open);
+        assert!(result.connect_time_ms.is_some());
+    }
+
+#[test]
+    fn tcp_check_local_closed_port() {
+        let result = tcp_check("127.0.0.1".to_string(), 1).expect("tcp check failed");
+
+        assert_eq!(result.target, "127.0.0.1");
+        assert_eq!(result.port, 1);
+        assert!(!result.open);
+        assert!(result.connect_time_ms.is_none());
+    }
+
 }

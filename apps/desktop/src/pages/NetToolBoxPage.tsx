@@ -30,12 +30,38 @@ interface DnsInfo {
   servers: string[];
 }
 
+interface PingResult {
+  target: string;
+  sent: number;
+  received: number;
+  packet_loss: number;
+  min_ms: number | null;
+  avg_ms: number | null;
+  max_ms: number | null;
+}
+
+interface TcpCheckResult {
+  target: string;
+  port: number;
+  open: boolean;
+  connect_time_ms: number | null;
+}
+
 export function NetToolBoxPage() {
   const [interfaces, setInterfaces] = useState<NetworkInterfaceInfo[]>([]);
   const [error, setError] = useState("");
   const [routes, setRoutes] = useState<NetworkRouteInfo[]>([]);
   const [dnsInfo, setDnsInfo] = useState<DnsInfo | null>(null);
   const [neighbors, setNeighbors] = useState<NetworkNeighborInfo[]>([]);
+  const [pingTarget, setPingTarget] = useState("192.168.1.254");
+  const [pingResult, setPingResult] = useState<PingResult | null>(null);
+  const [pingError, setPingError] = useState("");
+  const [isPinging, setIsPinging] = useState(false);
+  const [tcpTarget, setTcpTarget] = useState("127.0.0.1");
+  const [tcpPort, setTcpPort] = useState("22");
+  const [tcpResult, setTcpResult] = useState<TcpCheckResult | null>(null);
+  const [tcpError, setTcpError] = useState("");
+  const [isTcpChecking, setIsTcpChecking] = useState(false);
   console.log("NEXUS neighbors:", neighbors);
 
   useEffect(() => {
@@ -65,8 +91,241 @@ export function NetToolBoxPage() {
 
   }, []);
 
+  async function handlePing() {
+  if (!pingTarget.trim()) {
+    setPingError("Enter a target.");
+    return;
+  }
+
+  setIsPinging(true);
+  setPingError("");
+  setPingResult(null);
+
+  try {
+    const result = await invoke<PingResult>("ping_host", {
+      target: pingTarget.trim(),
+    });
+
+    setPingResult(result);
+  } catch (error) {
+    setPingError(String(error));
+  } finally {
+    setIsPinging(false);
+  }
+}
+
+async function handleTcpCheck() {
+  if (!tcpTarget.trim()) {
+    setTcpError("Enter a target.");
+    return;
+  }
+
+  const port = Number(tcpPort);
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    setTcpError("Enter a valid TCP port between 1 and 65535.");
+    return;
+  }
+
+  setIsTcpChecking(true);
+  setTcpError("");
+  setTcpResult(null);
+
+  try {
+    const result = await invoke<TcpCheckResult>("tcp_check", {
+      target: tcpTarget.trim(),
+      port,
+    });
+
+    setTcpResult(result);
+  } catch (error) {
+    setTcpError(String(error));
+  } finally {
+    setIsTcpChecking(false);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   return (
     <>
+    <section className="mb-6">
+  <Card>
+    <div className="mb-5">
+      <p className="text-xs tracking-[0.2em] text-[#9D8589]">CONNECTIVITY</p>
+      <h2 className="mt-2 text-lg font-semibold">Ping</h2>
+      <p className="mt-1 text-sm text-[#9D8589]">
+        Measure latency and packet loss to a target.
+      </p>
+    </div>
+
+    <div className="flex flex-col gap-3 sm:flex-row">
+      <input
+        type="text"
+        value={pingTarget}
+        onChange={(event) => setPingTarget(event.target.value)}
+        placeholder="192.168.1.254"
+        className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
+      />
+
+      <button
+        type="button"
+        onClick={handlePing}
+        disabled={isPinging}
+        className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isPinging ? "PINGING..." : "PING"}
+      </button>
+    </div>
+
+    {pingError && (
+      <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+        {pingError}
+      </p>
+    )}
+
+    {pingResult && (
+      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div>
+          <p className="text-[10px] text-[#9D8589]">PACKETS</p>
+          <p className="mt-1 font-mono text-sm">
+            {pingResult.received}/{pingResult.sent}
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">LOSS</p>
+          <p className="mt-1 font-mono text-sm">{pingResult.packet_loss}%</p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">AVG</p>
+          <p className="mt-1 font-mono text-sm">
+            {pingResult.avg_ms !== null ? `${pingResult.avg_ms.toFixed(2)} ms` : "—"}
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">MIN / MAX</p>
+          <p className="mt-1 font-mono text-sm">
+            {pingResult.min_ms !== null && pingResult.max_ms !== null
+              ? `${pingResult.min_ms.toFixed(2)} / ${pingResult.max_ms.toFixed(2)} ms`
+              : "—"}
+          </p>
+        </div>
+      </div>
+    )}
+  </Card>
+</section>
+
+<section className="mb-6">
+  <Card>
+    <div className="mb-5">
+      <p className="text-xs tracking-[0.2em] text-[#9D8589]">CONNECTIVITY</p>
+      <h2 className="mt-2 text-lg font-semibold">TCP Port Check</h2>
+      <p className="mt-1 text-sm text-[#9D8589]">
+        Check whether a TCP port is accepting connections.
+      </p>
+    </div>
+
+    <div className="flex flex-col gap-3 sm:flex-row">
+      <input
+        type="text"
+        value={tcpTarget}
+        onChange={(event) => setTcpTarget(event.target.value)}
+        placeholder="192.168.1.254"
+        className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
+      />
+
+      <input
+        type="number"
+        min="1"
+        max="65535"
+        value={tcpPort}
+        onChange={(event) => setTcpPort(event.target.value)}
+        placeholder="443"
+        className="w-full rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826] sm:w-32"
+      />
+
+      <button
+        type="button"
+        onClick={handleTcpCheck}
+        disabled={isTcpChecking}
+        className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isTcpChecking ? "CHECKING..." : "CHECK"}
+      </button>
+    </div>
+
+    {tcpError && (
+      <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+        {tcpError}
+      </p>
+    )}
+
+    {tcpResult && (
+      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3">
+        <div>
+          <p className="text-[10px] text-[#9D8589]">TARGET</p>
+          <p className="mt-1 break-all font-mono text-sm">
+            {tcpResult.target}
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">PORT</p>
+          <p className="mt-1 font-mono text-sm">{tcpResult.port}</p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">STATUS</p>
+          <p className="mt-1 font-mono text-sm">
+            {tcpResult.open ? "OPEN" : "CLOSED"}
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">CONNECT TIME</p>
+          <p className="mt-1 font-mono text-sm">
+            {tcpResult.connect_time_ms !== null
+              ? `${tcpResult.connect_time_ms.toFixed(2)} ms`
+              : "—"}
+          </p>
+        </div>
+      </div>
+    )}
+  </Card>
+</section>
+
+
+
+
+
+
+
+
+
+
       <div className="mb-10">
         <p className="font-mono text-xs tracking-[0.25em] text-[#9D8589]">
           // NETWORK DIAGNOSTICS
