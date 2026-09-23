@@ -56,6 +56,13 @@ struct TcpCheckResult {
     connect_time_ms: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct TracerouteHop {
+    hop: u32,
+    address: Option<String>,
+    latency_ms: Option<f64>,
+}
+
 #[tauri::command]
 fn ping_host(target: String) -> Result<PingResult, String> {
     let output = std::process::Command::new("ping")
@@ -166,6 +173,60 @@ fn tcp_check(target: String, port: u16) -> Result<TcpCheckResult, String> {
             connect_time_ms: None,
         }),
     }
+}
+
+#[tauri::command]
+fn traceroute_host(target: String) -> Result<Vec<TracerouteHop>, String> {
+    let output = std::process::Command::new("traceroute")
+        .args(["-n", "-m", "20", "-w", "2", &target])
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() && output.stdout.is_empty() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hops = Vec::new();
+
+    for line in stdout.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+
+        let Some(hop) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+
+        let remaining: Vec<&str> = parts.collect();
+
+        if remaining.is_empty() {
+            continue;
+        }
+
+        if remaining[0] == "*" {
+            hops.push(TracerouteHop {
+                hop,
+                address: None,
+                latency_ms: None,
+            });
+
+            continue;
+        }
+
+        let address = remaining.first().map(|value| (*value).to_string());
+
+        let latency_ms = remaining
+            .iter()
+            .skip(1)
+            .find_map(|value| value.trim_end_matches("ms").parse::<f64>().ok());
+
+        hops.push(TracerouteHop {
+            hop,
+            address,
+            latency_ms,
+        });
+    }
+
+    Ok(hops)
 }
 
 fn is_interface_up(name: &str) -> bool {
@@ -455,7 +516,8 @@ pub fn run() {
             network_neighbors,
             dns_info,
             ping_host,
-            tcp_check
+            tcp_check,
+            traceroute_host
 ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

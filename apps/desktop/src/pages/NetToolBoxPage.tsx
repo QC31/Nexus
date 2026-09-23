@@ -47,6 +47,12 @@ interface TcpCheckResult {
   connect_time_ms: number | null;
 }
 
+interface TracerouteHop {
+  hop: number;
+  address: string | null;
+  latency_ms: number | null;
+}
+
 export function NetToolBoxPage() {
   const [interfaces, setInterfaces] = useState<NetworkInterfaceInfo[]>([]);
   const [error, setError] = useState("");
@@ -62,6 +68,10 @@ export function NetToolBoxPage() {
   const [tcpResult, setTcpResult] = useState<TcpCheckResult | null>(null);
   const [tcpError, setTcpError] = useState("");
   const [isTcpChecking, setIsTcpChecking] = useState(false);
+  const [tracerouteTarget, setTracerouteTarget] = useState("192.168.1.254");
+  const [tracerouteResult, setTracerouteResult] = useState<TracerouteHop[]>([]);
+  const [tracerouteError, setTracerouteError] = useState("");
+  const [isTracerouting, setIsTracerouting] = useState(false);
   console.log("NEXUS neighbors:", neighbors);
 
   useEffect(() => {
@@ -145,27 +155,28 @@ async function handleTcpCheck() {
   }
 }
 
+async function handleTraceroute() {
+  if (!tracerouteTarget.trim()) {
+    setTracerouteError("Enter a target.");
+    return;
+  }
 
+  setIsTracerouting(true);
+  setTracerouteError("");
+  setTracerouteResult([]);
 
+  try {
+    const result = await invoke<TracerouteHop[]>("traceroute_host", {
+      target: tracerouteTarget.trim(),
+    });
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    setTracerouteResult(result);
+  } catch (error) {
+    setTracerouteError(String(error));
+  } finally {
+    setIsTracerouting(false);
+  }
+}
 
   return (
     <>
@@ -317,14 +328,71 @@ async function handleTcpCheck() {
   </Card>
 </section>
 
+<section className="mb-6">
+  <Card>
+    <div className="mb-5">
+      <p className="text-xs tracking-[0.2em] text-[#9D8589]">CONNECTIVITY</p>
+      <h2 className="mt-2 text-lg font-semibold">Traceroute</h2>
+      <p className="mt-1 text-sm text-[#9D8589]">
+        Trace the network path to a target.
+      </p>
+    </div>
 
+    <div className="flex flex-col gap-3 sm:flex-row">
+      <input
+        type="text"
+        value={tracerouteTarget}
+        onChange={(event) => setTracerouteTarget(event.target.value)}
+        placeholder="192.168.1.254"
+        className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
+      />
 
+      <button
+        type="button"
+        onClick={handleTraceroute}
+        disabled={isTracerouting}
+        className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isTracerouting ? "TRACING..." : "TRACE"}
+      </button>
+    </div>
 
+    {tracerouteError && (
+      <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+        {tracerouteError}
+      </p>
+    )}
 
+    {tracerouteResult.length > 0 && (
+      <div className="mt-5 space-y-2">
+        {tracerouteResult.map((hop) => (
+          <div
+            key={hop.hop}
+            className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+          >
+            <div className="grid grid-cols-[3rem_1fr_auto] items-center gap-4 font-mono text-xs">
+              <div className="text-[#9D8589]">
+                {String(hop.hop).padStart(2, "0")}
+              </div>
 
+              <div className="min-w-0">
+                <p className="break-all">
+                  {hop.address ?? "*"}
+                </p>
+              </div>
 
-
-
+              <div className="text-right text-[#9D8589]">
+                {hop.latency_ms !== null
+                  ? `${hop.latency_ms.toFixed(2)} ms`
+                  : "—"}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
+  </Card>
+</section>
 
       <div className="mb-10">
         <p className="font-mono text-xs tracking-[0.25em] text-[#9D8589]">
