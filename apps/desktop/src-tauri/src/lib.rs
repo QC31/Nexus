@@ -57,6 +57,13 @@ struct TcpCheckResult {
 }
 
 #[derive(Debug, Serialize)]
+struct DnsLookupResult {
+    name: String,
+    record_type: String,
+    records: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct TracerouteHop {
     hop: u32,
     address: Option<String>,
@@ -173,6 +180,48 @@ fn tcp_check(target: String, port: u16) -> Result<TcpCheckResult, String> {
             connect_time_ms: None,
         }),
     }
+}
+
+#[tauri::command]
+async fn dns_lookup(
+    name: String,
+    record_type: String,
+) -> Result<DnsLookupResult, String> {
+    use hickory_resolver::proto::rr::RecordType;
+    use hickory_resolver::TokioResolver;
+
+    let record_type = match record_type.to_uppercase().as_str() {
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "CNAME" => RecordType::CNAME,
+        "MX" => RecordType::MX,
+        "NS" => RecordType::NS,
+        "TXT" => RecordType::TXT,
+        "SOA" => RecordType::SOA,
+        _ => return Err("Unsupported DNS record type".to_string()),
+    };
+
+    let resolver = TokioResolver::builder_tokio()
+        .map_err(|error| error.to_string())?
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let response = resolver
+        .lookup(name.as_str(), record_type)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let records = response
+        .answers()
+        .iter()
+        .map(|record| record.to_string())
+        .collect();
+
+    Ok(DnsLookupResult {
+        name,
+        record_type: record_type.to_string(),
+        records,
+    })
 }
 
 #[tauri::command]
@@ -517,7 +566,8 @@ pub fn run() {
             dns_info,
             ping_host,
             tcp_check,
-            traceroute_host
+            traceroute_host,
+            dns_lookup
 ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -560,5 +610,16 @@ mod tests {
         assert!(!result.open);
         assert!(result.connect_time_ms.is_none());
     }
+
+#[tokio::test]
+async fn dns_lookup_a_record() {
+    let result = dns_lookup("example.com".to_string(), "A".to_string())
+        .await
+        .expect("DNS lookup failed");
+
+    assert_eq!(result.name, "example.com");
+    assert_eq!(result.record_type, "A");
+    assert!(!result.records.is_empty());
+}
 
 }

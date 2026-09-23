@@ -47,6 +47,12 @@ interface TcpCheckResult {
   connect_time_ms: number | null;
 }
 
+interface DnsLookupResult {
+  name: string;
+  record_type: string;
+  records: string[];
+}
+
 interface TracerouteHop {
   hop: number;
   address: string | null;
@@ -72,6 +78,11 @@ export function NetToolBoxPage() {
   const [tracerouteResult, setTracerouteResult] = useState<TracerouteHop[]>([]);
   const [tracerouteError, setTracerouteError] = useState("");
   const [isTracerouting, setIsTracerouting] = useState(false);
+  const [dnsLookupName, setDnsLookupName] = useState("example.com");
+  const [dnsLookupType, setDnsLookupType] = useState("A");
+  const [dnsLookupResult, setDnsLookupResult] = useState<DnsLookupResult | null>(null);
+  const [dnsLookupError, setDnsLookupError] = useState("");
+  const [isDnsLookingUp, setIsDnsLookingUp] = useState(false);
   console.log("NEXUS neighbors:", neighbors);
 
   useEffect(() => {
@@ -175,6 +186,30 @@ async function handleTraceroute() {
     setTracerouteError(String(error));
   } finally {
     setIsTracerouting(false);
+  }
+}
+
+async function handleDnsLookup() {
+  if (!dnsLookupName.trim()) {
+    setDnsLookupError("Enter a domain name.");
+    return;
+  }
+
+  setIsDnsLookingUp(true);
+  setDnsLookupError("");
+  setDnsLookupResult(null);
+
+  try {
+    const result = await invoke<DnsLookupResult>("dns_lookup", {
+      name: dnsLookupName.trim(),
+      recordType: dnsLookupType,
+  });
+
+    setDnsLookupResult(result);
+  } catch (error) {
+    setDnsLookupError(String(error));
+  } finally {
+    setIsDnsLookingUp(false);
   }
 }
 
@@ -389,6 +424,100 @@ async function handleTraceroute() {
             </div>
           </div>
         ))}
+      </div>
+    )}
+  </Card>
+</section>
+
+<section className="mb-6">
+  <Card>
+    <div className="mb-5">
+      <p className="text-xs tracking-[0.2em] text-[#9D8589]">DNS</p>
+      <h2 className="mt-2 text-lg font-semibold">DNS Lookup</h2>
+      <p className="mt-1 text-sm text-[#9D8589]">
+        Query DNS records for a domain.
+      </p>
+    </div>
+
+    <div className="flex flex-col gap-3 lg:flex-row">
+      <input
+        type="text"
+        value={dnsLookupName}
+        onChange={(event) => setDnsLookupName(event.target.value)}
+        placeholder="example.com"
+        className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
+      />
+
+      <div className="relative">
+  <label htmlFor="dns-record-type" className="sr-only">
+    DNS record type
+  </label>
+
+  <select
+    id="dns-record-type"
+    value={dnsLookupType}
+    onChange={(event) => setDnsLookupType(event.target.value)}
+    className="w-full appearance-none rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 pr-10 font-mono text-sm font-semibold text-[#EEE5E6] outline-none focus:border-[#B52636] focus:ring-1 focus:ring-[#8F1826]"
+  >
+    <option value="A">A</option>
+    <option value="AAAA">AAAA</option>
+    <option value="CNAME">CNAME</option>
+    <option value="MX">MX</option>
+    <option value="NS">NS</option>
+    <option value="TXT">TXT</option>
+    <option value="SOA">SOA</option>
+  </select>
+
+  <div className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#B52636]">
+    <svg
+      className="h-4 w-4"
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path
+        fillRule="evenodd"
+        d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
+        clipRule="evenodd"
+      />
+    </svg>
+  </div>
+</div>
+
+      <button
+        type="button"
+        onClick={handleDnsLookup}
+        disabled={isDnsLookingUp}
+        className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isDnsLookingUp ? "LOOKING UP..." : "LOOKUP"}
+      </button>
+    </div>
+
+    {dnsLookupError && (
+      <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+        {dnsLookupError}
+      </p>
+    )}
+
+    {dnsLookupResult && (
+      <div className="mt-5 space-y-2">
+        {dnsLookupResult.records.length > 0 ? (
+          dnsLookupResult.records.map((record, index) => (
+            <div
+              key={`${record}-${index}`}
+              className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+            >
+              <p className="break-all font-mono text-xs">{record}</p>
+            </div>
+          ))
+        ) : (
+          <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
+            <p className="font-mono text-xs text-[#9D8589]">
+              No records found.
+            </p>
+          </div>
+        )}
       </div>
     )}
   </Card>
