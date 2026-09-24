@@ -64,10 +64,57 @@ struct DnsLookupResult {
 }
 
 #[derive(Debug, Serialize)]
+struct HttpDiagnosticResult {
+    url: String,
+    final_url: String,
+    status_code: u16,
+    response_time_ms: f64,
+    response_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct TracerouteHop {
     hop: u32,
     address: Option<String>,
     latency_ms: Option<f64>,
+}
+
+#[tauri::command]
+async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
+    use std::time::Instant;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let start = Instant::now();
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let response_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let final_url = response.url().to_string();
+    let status_code = response.status().as_u16();
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let response_size_bytes = body.len() as u64;
+
+    Ok(HttpDiagnosticResult {
+        url,
+        final_url,
+        status_code,
+        response_time_ms,
+        response_size_bytes,
+    })
 }
 
 #[tauri::command]
@@ -567,7 +614,8 @@ pub fn run() {
             ping_host,
             tcp_check,
             traceroute_host,
-            dns_lookup
+            dns_lookup,
+            http_diagnostic
 ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

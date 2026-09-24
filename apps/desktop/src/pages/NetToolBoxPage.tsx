@@ -53,6 +53,14 @@ interface DnsLookupResult {
   records: string[];
 }
 
+interface HttpDiagnosticResult {
+  url: string;
+  final_url: string;
+  status_code: number;
+  response_time_ms: number;
+  response_size_bytes: number;
+}
+
 interface TracerouteHop {
   hop: number;
   address: string | null;
@@ -83,6 +91,10 @@ export function NetToolBoxPage() {
   const [dnsLookupResult, setDnsLookupResult] = useState<DnsLookupResult | null>(null);
   const [dnsLookupError, setDnsLookupError] = useState("");
   const [isDnsLookingUp, setIsDnsLookingUp] = useState(false);
+  const [httpUrl, setHttpUrl] = useState("https://example.com");
+  const [httpResult, setHttpResult] = useState<HttpDiagnosticResult | null>(null);
+  const [httpError, setHttpError] = useState("");
+  const [isHttpChecking, setIsHttpChecking] = useState(false);
   console.log("NEXUS neighbors:", neighbors);
 
   useEffect(() => {
@@ -210,6 +222,29 @@ async function handleDnsLookup() {
     setDnsLookupError(String(error));
   } finally {
     setIsDnsLookingUp(false);
+  }
+}
+
+async function handleHttpDiagnostic() {
+  if (!httpUrl.trim()) {
+    setHttpError("Enter a URL.");
+    return;
+  }
+
+  setIsHttpChecking(true);
+  setHttpError("");
+  setHttpResult(null);
+
+  try {
+    const result = await invoke<HttpDiagnosticResult>("http_diagnostic", {
+      url: httpUrl.trim(),
+    });
+
+    setHttpResult(result);
+  } catch (error) {
+    setHttpError(String(error));
+  } finally {
+    setIsHttpChecking(false);
   }
 }
 
@@ -730,6 +765,75 @@ async function handleDnsLookup() {
     No network neighbors detected.
   </p>
 )}
+
+
+
+
+<section className="mt-8">
+  <h2 className="font-mono text-xs tracking-[0.2em] text-[#9D8589]">
+    HTTP / HTTPS
+  </h2>
+
+  <div className="mt-4 flex gap-3">
+    <input
+      type="url"
+      value={httpUrl}
+      onChange={(event) => setHttpUrl(event.target.value)}
+      className="flex-1 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none focus:border-[#B52636]"
+    />
+
+    <button
+      type="button"
+      onClick={handleHttpDiagnostic}
+      disabled={isHttpChecking}
+      className="rounded-md bg-[#8F1826] px-5 py-3 text-sm font-semibold transition-colors hover:bg-[#B52636] disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {isHttpChecking ? "CHECKING..." : "CHECK"}
+    </button>
+  </div>
+
+  {httpError && (
+    <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+      {httpError}
+    </p>
+  )}
+
+  {httpResult && (
+    <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">STATUS</p>
+        <p className="mt-1 font-mono">{httpResult.status_code}</p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">RESPONSE TIME</p>
+        <p className="mt-1 font-mono">
+          {httpResult.response_time_ms.toFixed(2)} ms
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">RESPONSE SIZE</p>
+        <p className="mt-1 font-mono">
+          {httpResult.response_size_bytes} bytes
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">FINAL URL</p>
+        <p className="mt-1 break-all font-mono text-xs">
+          {httpResult.final_url}
+        </p>
+      </div>
+    </div>
+  )}
+</section>
+
+
+
+
+
+
 
 
 
