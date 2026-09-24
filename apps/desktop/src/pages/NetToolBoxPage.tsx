@@ -53,6 +53,11 @@ interface DnsLookupResult {
   records: string[];
 }
 
+interface ReverseDnsResult {
+  ip_address: string;
+  hostnames: string[];
+}
+
 interface HttpHeader {
   name: string;
   value: string;
@@ -116,6 +121,11 @@ export function NetToolBoxPage() {
   const [dnsLookupResult, setDnsLookupResult] = useState<DnsLookupResult | null>(null);
   const [dnsLookupError, setDnsLookupError] = useState("");
   const [isDnsLookingUp, setIsDnsLookingUp] = useState(false);
+  const [reverseDnsIp, setReverseDnsIp] = useState("192.168.1.254");
+  const [reverseDnsResult, setReverseDnsResult] =
+  useState<ReverseDnsResult | null>(null);
+  const [reverseDnsError, setReverseDnsError] = useState("");
+  const [isReverseDnsLookingUp, setIsReverseDnsLookingUp] = useState(false);
   const [httpUrl, setHttpUrl] = useState("https://example.com");
   const [httpResult, setHttpResult] = useState<HttpDiagnosticResult | null>(null);
   const [httpError, setHttpError] = useState("");
@@ -247,6 +257,29 @@ async function handleDnsLookup() {
     setDnsLookupError(String(error));
   } finally {
     setIsDnsLookingUp(false);
+  }
+}
+
+async function handleReverseDnsLookup() {
+  if (!reverseDnsIp.trim()) {
+    setReverseDnsError("Enter an IP address.");
+    return;
+  }
+
+  setIsReverseDnsLookingUp(true);
+  setReverseDnsError("");
+  setReverseDnsResult(null);
+
+  try {
+    const result = await invoke<ReverseDnsResult>("reverse_dns_lookup", {
+      ipAddress: reverseDnsIp.trim(),
+    });
+
+    setReverseDnsResult(result);
+  } catch (error) {
+    setReverseDnsError(String(error));
+  } finally {
+    setIsReverseDnsLookingUp(false);
   }
 }
 
@@ -583,6 +616,64 @@ async function handleHttpDiagnostic() {
   </Card>
 </section>
 
+<div className="mt-4 rounded-lg border border-[#3B171D] bg-[#170A0D] p-5">
+  <p className="text-xs tracking-[0.15em] text-[#9D8589]">
+    REVERSE DNS
+  </p>
+
+  <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+    <input
+      type="text"
+      value={reverseDnsIp}
+      onChange={(event) => setReverseDnsIp(event.target.value)}
+      placeholder="192.168.1.254"
+      className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-3 py-2 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5A5E] focus:border-[#B52636]"
+    />
+
+    <button
+      type="button"
+      onClick={handleReverseDnsLookup}
+      disabled={isReverseDnsLookingUp}
+      className="rounded-md bg-[#8F1826] px-5 py-2 text-sm font-medium transition-colors hover:bg-[#B52636] disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {isReverseDnsLookingUp ? "LOOKING UP..." : "LOOKUP"}
+    </button>
+  </div>
+
+  {reverseDnsError && (
+    <p className="mt-3 text-xs text-[#D45767]">
+      {reverseDnsError}
+    </p>
+  )}
+
+  {reverseDnsResult && (
+    <div className="mt-4 rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+      <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+        HOSTNAMES
+      </p>
+
+      <div className="mt-3">
+        {reverseDnsResult.hostnames.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {reverseDnsResult.hostnames.map((hostname) => (
+              <span
+                key={hostname}
+                className="rounded border border-[#3B171D] bg-[#170A0D] px-2 py-1 font-mono text-xs"
+              >
+                {hostname}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="font-mono text-xs text-[#9D8589]">
+            No PTR record found.
+          </p>
+        )}
+      </div>
+    </div>
+  )}
+</div>
+
 <section className="mt-8">
   <h2 className="font-mono text-xs tracking-[0.2em] text-[#9D8589]">
     HTTP / HTTPS
@@ -777,6 +868,7 @@ async function handleHttpDiagnostic() {
 </section>
 
     <br></br>
+
       <div className="mb-10">
         <p className="font-mono text-xs tracking-[0.25em] text-[#9D8589]">
           // NETWORK DIAGNOSTICS

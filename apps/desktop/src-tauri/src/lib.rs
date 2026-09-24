@@ -475,6 +475,48 @@ async fn dns_lookup(
     })
 }
 
+#[derive(Debug, Serialize)]
+struct ReverseDnsResult {
+    ip_address: String,
+    hostnames: Vec<String>,
+}
+
+#[tauri::command]
+async fn reverse_dns_lookup(ip_address: String) -> Result<ReverseDnsResult, String> {
+    use std::net::IpAddr;
+
+    use hickory_resolver::TokioResolver;
+
+    let ip: IpAddr = ip_address
+        .trim()
+        .parse()
+        .map_err(|error| format!("Invalid IP address: {error}"))?;
+
+    let resolver = TokioResolver::builder_tokio()
+        .map_err(|error| error.to_string())?
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let response = resolver
+        .reverse_lookup(ip)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let hostnames = response
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::PTR(name) => Some(name.to_utf8()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ReverseDnsResult {
+        ip_address,
+        hostnames,
+    })
+}
+
 #[tauri::command]
 fn traceroute_host(target: String) -> Result<Vec<TracerouteHop>, String> {
     let output = std::process::Command::new("traceroute")
@@ -819,6 +861,7 @@ pub fn run() {
             tcp_check,
             traceroute_host,
             dns_lookup,
+            reverse_dns_lookup,
             http_diagnostic
 ])
         .run(tauri::generate_context!())
