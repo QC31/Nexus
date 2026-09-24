@@ -64,12 +64,40 @@ struct DnsLookupResult {
 }
 
 #[derive(Debug, Serialize)]
+struct HttpHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct HttpRedirect {
+    url: String,
+    status_code: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct TlsInfo {
+    version: Option<String>,
+    cipher_suite: Option<String>,
+    subject: Option<String>,
+    issuer: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    days_remaining: Option<i64>,
+    certificate_status: Option<String>,
+    domains: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct HttpDiagnosticResult {
     url: String,
     final_url: String,
     status_code: u16,
     response_time_ms: f64,
     response_size_bytes: u64,
+    headers: Vec<HttpHeader>,
+    redirects: Vec<HttpRedirect>,
+    tls: Option<TlsInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,12 +107,153 @@ struct TracerouteHop {
     latency_ms: Option<f64>,
 }
 
+async fn inspect_tls(host: &str, port: u16) -> Result<TlsInfo, String> {
+    use rustls::pki_types::ServerName;
+    use rustls::ClientConfig;
+    use rustls_platform_verifier::ConfigVerifierExt;
+    use std::sync::Arc;
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+
+    let address = format!("{host}:{port}");
+
+    let tcp_stream = TcpStream::connect(&address)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|error| format!("Invalid TLS server name: {error}"))?;
+
+    let config = ClientConfig::with_platform_verifier()
+        .map_err(|error| error.to_string())?;
+
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let tls_stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let (_, connection) = tls_stream.get_ref();
+
+    let version = connection
+        .protocol_version()
+        .map(|value| format!("{value:?}"));
+
+    let cipher_suite = connection
+        .negotiated_cipher_suite()
+        .map(|value| format!("{:?}", value.suite()));
+
+    let certificate = connection
+        .peer_certificates()
+        .and_then(|certificates| certificates.first());
+
+    let (
+        subject,
+        issuer,
+        valid_from,
+        valid_until,
+        days_remaining,
+        certificate_status,
+        domains,
+    ) = if let Some(certificate) = certificate {
+        let (_, parsed_certificate) =
+            x509_parser::parse_x509_certificate(certificate.as_ref())
+                .map_err(|error| error.to_string())?;
+
+        let domains = parsed_certificate
+            .subject_alternative_name()
+            .ok()
+            .flatten()
+            .map(|extension| {
+                extension
+                    .value
+                    .general_names
+                    .iter()
+                    .filter_map(|name| match name {
+                        x509_parser::extensions::GeneralName::DNSName(domain) => {
+                            Some(domain.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let not_before = parsed_certificate.validity().not_before;
+        let not_after = parsed_certificate.validity().not_after;
+
+        let now = x509_parser::time::ASN1Time::now();
+
+        let days_remaining = {
+            let seconds = not_after.timestamp() - now.timestamp();
+            seconds.div_euclid(86_400)
+        };
+
+        let certificate_status = if now < not_before {
+            "NOT_YET_VALID".to_string()
+        } else if now > not_after {
+            "EXPIRED".to_string()
+        } else {
+            "VALID".to_string()
+        };
+
+        (
+            Some(parsed_certificate.subject().to_string()),
+            Some(parsed_certificate.issuer().to_string()),
+            Some(not_before.to_string()),
+            Some(not_after.to_string()),
+            Some(days_remaining),
+            Some(certificate_status),
+            domains,
+        )
+    } else {
+        (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+    };
+
+    Ok(TlsInfo {
+        version,
+        cipher_suite,
+        subject,
+        issuer,
+        valid_from,
+        valid_until,
+        days_remaining,
+        certificate_status,
+        domains,
+    })
+}
+
 #[tauri::command]
 async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
     use std::time::Instant;
 
+    let redirect_chain = std::sync::Arc::new(std::sync::Mutex::new(Vec::<HttpRedirect>::new()));
+    let redirect_chain_for_policy = std::sync::Arc::clone(&redirect_chain);
+
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.stop();
+            }
+
+            if let Ok(mut redirects) = redirect_chain_for_policy.lock() {
+                redirects.push(HttpRedirect {
+                    url: attempt.url().to_string(),
+                    status_code: attempt.status().as_u16(),
+                });
+            }
+
+            attempt.follow()
+        }))
         .build()
         .map_err(|error| error.to_string())?;
 
@@ -96,10 +265,38 @@ async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
         .await
         .map_err(|error| error.to_string())?;
 
+    let tls = if url.to_lowercase().starts_with("https://") {
+        let parsed_url =
+            reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
+
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| "Unable to determine HTTPS host".to_string())?;
+
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
+
+        Some(inspect_tls(host, port).await?)
+    } else {
+        None
+    };
+
+
     let response_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let final_url = response.url().to_string();
     let status_code = response.status().as_u16();
+
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| HttpHeader {
+            name: name.to_string(),
+            value: value
+                .to_str()
+                .unwrap_or("<non-UTF8>")
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
 
     let body = response
         .bytes()
@@ -107,6 +304,10 @@ async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
         .map_err(|error| error.to_string())?;
 
     let response_size_bytes = body.len() as u64;
+    let redirects = redirect_chain
+        .lock()
+        .map_err(|_| "Unable to access redirect chain".to_string())?
+        .clone();
 
     Ok(HttpDiagnosticResult {
         url,
@@ -114,6 +315,9 @@ async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
         status_code,
         response_time_ms,
         response_size_bytes,
+        headers,
+        redirects,
+        tls,
     })
 }
 

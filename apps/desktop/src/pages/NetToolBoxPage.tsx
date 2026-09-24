@@ -53,12 +53,37 @@ interface DnsLookupResult {
   records: string[];
 }
 
+interface HttpHeader {
+  name: string;
+  value: string;
+}
+
+interface HttpRedirect {
+  url: string;
+  status_code: number;
+}
+
+interface TlsInfo {
+  version: string | null;
+  cipher_suite: string | null;
+  subject: string | null;
+  issuer: string | null;
+  valid_from: string | null;
+  valid_until: string | null;
+  days_remaining: number | null;
+  certificate_status: string | null;
+  domains: string[];
+}
+
 interface HttpDiagnosticResult {
   url: string;
   final_url: string;
   status_code: number;
   response_time_ms: number;
   response_size_bytes: number;
+  headers: HttpHeader[];
+  redirects: HttpRedirect[];
+  tls: TlsInfo | null;
 }
 
 interface TracerouteHop {
@@ -558,6 +583,200 @@ async function handleHttpDiagnostic() {
   </Card>
 </section>
 
+<section className="mt-8">
+  <h2 className="font-mono text-xs tracking-[0.2em] text-[#9D8589]">
+    HTTP / HTTPS
+  </h2>
+
+  <div className="mt-4 flex gap-3">
+    <input
+      type="url"
+      value={httpUrl}
+      onChange={(event) => setHttpUrl(event.target.value)}
+      className="flex-1 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none focus:border-[#B52636]"
+    />
+
+    <button
+      type="button"
+      onClick={handleHttpDiagnostic}
+      disabled={isHttpChecking}
+      className="rounded-md bg-[#8F1826] px-5 py-3 text-sm font-semibold transition-colors hover:bg-[#B52636] disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {isHttpChecking ? "CHECKING..." : "CHECK"}
+    </button>
+  </div>
+
+  {httpError && (
+    <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+      {httpError}
+    </p>
+  )}
+
+  {httpResult && (
+  <>
+    <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">STATUS</p>
+        <p className="mt-1 font-mono">{httpResult.status_code}</p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">RESPONSE TIME</p>
+        <p className="mt-1 font-mono">
+          {httpResult.response_time_ms.toFixed(2)} ms
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">RESPONSE SIZE</p>
+        <p className="mt-1 font-mono">
+          {httpResult.response_size_bytes} bytes
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+        <p className="text-[10px] text-[#9D8589]">FINAL URL</p>
+        <p className="mt-1 break-all font-mono text-xs">
+          {httpResult.final_url}
+        </p>
+      </div>
+    </div>
+
+    <div className="mt-4 rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+      <p className="text-[10px] text-[#9D8589]">RESPONSE HEADERS</p>
+
+      <div className="mt-3 space-y-2">
+        {httpResult.headers.map((header) => (
+          <div
+            key={`${header.name}-${header.value}`}
+            className="grid grid-cols-1 gap-1 font-mono text-xs sm:grid-cols-[180px_1fr]"
+          >
+            <span className="text-[#B52636]">{header.name}</span>
+            <span className="break-all text-[#9D8589]">{header.value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+    <div className="mt-4 rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+  <p className="text-[10px] text-[#9D8589]">REDIRECT CHAIN</p>
+
+  {httpResult.tls && (
+  <div className="mt-4 rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
+    <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+      TLS
+    </p>
+
+<div className="mb-4">
+  <p className="text-[10px] text-[#9D8589]">DOMAINS</p>
+
+  <div className="mt-2 flex flex-wrap gap-2">
+    {httpResult.tls.domains.length > 0 ? (
+      httpResult.tls.domains.map((domain) => (
+        <span
+          key={domain}
+          className="rounded border border-[#3B171D] bg-[#170A0D] px-2 py-1 font-mono text-xs"
+        >
+          {domain}
+        </span>
+      ))
+    ) : (
+      <span className="font-mono text-xs text-[#9D8589]">
+        —
+      </span>
+    )}
+  </div>
+</div>
+
+    <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+      <div>
+        <p className="text-[10px] text-[#9D8589]">VERSION</p>
+        <p className="mt-1 break-all font-mono text-xs">
+          {httpResult.tls.version ?? "—"}
+        </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">CIPHER SUITE</p>
+        <p className="mt-1 break-all font-mono text-xs">
+          {httpResult.tls.cipher_suite ?? "—"}
+        </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">SUBJECT</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#9D8589]">
+          {httpResult.tls.subject ?? "—"}
+        </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">ISSUER</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#9D8589]">
+          {httpResult.tls.issuer ?? "—"}
+        </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">CERTIFICATE STATUS</p>
+        <p className="mt-1 font-mono text-xs">
+        {httpResult.tls.certificate_status ?? "—"}
+      </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">DAYS REMAINING</p>
+        <p className="mt-1 font-mono text-xs">
+          {httpResult.tls.days_remaining !== null
+            ? `${httpResult.tls.days_remaining} days`
+          : "—"}
+        </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">VALID FROM</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#9D8589]">
+          {httpResult.tls.valid_from ?? "—"}
+        </p>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-[#9D8589]">VALID UNTIL</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#9D8589]">
+          {httpResult.tls.valid_until ?? "—"}
+        </p>
+      </div>
+    </div>
+  </div>
+)}
+
+  {httpResult.redirects.length === 0 ? (
+    <p className="mt-3 font-mono text-xs text-[#9D8589]">
+      No redirects
+    </p>
+  ) : (
+    <div className="mt-3 space-y-2">
+      {httpResult.redirects.map((redirect, index) => (
+        <div
+          key={`${redirect.status_code}-${redirect.url}-${index}`}
+          className="grid grid-cols-1 gap-1 rounded-md border border-[#3B171D] bg-[#170A0D] px-3 py-2 font-mono text-xs sm:grid-cols-[80px_1fr]"
+        >
+          <span className="text-[#B52636]">
+            {redirect.status_code}
+          </span>
+
+          <span className="break-all text-[#9D8589]">
+            {redirect.url}
+          </span>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+  </>
+)}
+</section>
+
+    <br></br>
       <div className="mb-10">
         <p className="font-mono text-xs tracking-[0.25em] text-[#9D8589]">
           // NETWORK DIAGNOSTICS
@@ -766,86 +985,7 @@ async function handleHttpDiagnostic() {
   </p>
 )}
 
-
-
-
-<section className="mt-8">
-  <h2 className="font-mono text-xs tracking-[0.2em] text-[#9D8589]">
-    HTTP / HTTPS
-  </h2>
-
-  <div className="mt-4 flex gap-3">
-    <input
-      type="url"
-      value={httpUrl}
-      onChange={(event) => setHttpUrl(event.target.value)}
-      className="flex-1 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none focus:border-[#B52636]"
-    />
-
-    <button
-      type="button"
-      onClick={handleHttpDiagnostic}
-      disabled={isHttpChecking}
-      className="rounded-md bg-[#8F1826] px-5 py-3 text-sm font-semibold transition-colors hover:bg-[#B52636] disabled:cursor-not-allowed disabled:opacity-50"
-    >
-      {isHttpChecking ? "CHECKING..." : "CHECK"}
-    </button>
-  </div>
-
-  {httpError && (
-    <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
-      {httpError}
-    </p>
-  )}
-
-  {httpResult && (
-    <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
-        <p className="text-[10px] text-[#9D8589]">STATUS</p>
-        <p className="mt-1 font-mono">{httpResult.status_code}</p>
-      </div>
-
-      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
-        <p className="text-[10px] text-[#9D8589]">RESPONSE TIME</p>
-        <p className="mt-1 font-mono">
-          {httpResult.response_time_ms.toFixed(2)} ms
-        </p>
-      </div>
-
-      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
-        <p className="text-[10px] text-[#9D8589]">RESPONSE SIZE</p>
-        <p className="mt-1 font-mono">
-          {httpResult.response_size_bytes} bytes
-        </p>
-      </div>
-
-      <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] p-4">
-        <p className="text-[10px] text-[#9D8589]">FINAL URL</p>
-        <p className="mt-1 break-all font-mono text-xs">
-          {httpResult.final_url}
-        </p>
-      </div>
-    </div>
-  )}
-</section>
-
-
-
-
-
-
-
-
-
-
-
-
 </div>
-
-
-
-
-
 
 </div>
         </Card>
