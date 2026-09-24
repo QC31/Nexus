@@ -51,6 +51,7 @@ interface DnsLookupResult {
   name: string;
   record_type: string;
   records: string[];
+  response_time_ms: number;
 }
 
 interface ReverseDnsResult {
@@ -593,26 +594,38 @@ async function handleHttpDiagnostic() {
       </p>
     )}
 
-    {dnsLookupResult && (
-      <div className="mt-5 space-y-2">
-        {dnsLookupResult.records.length > 0 ? (
-          dnsLookupResult.records.map((record, index) => (
-            <div
-              key={`${record}-${index}`}
-              className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
-            >
-              <p className="break-all font-mono text-xs">{record}</p>
-            </div>
-          ))
-        ) : (
-          <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
-            <p className="font-mono text-xs text-[#9D8589]">
-              No records found.
-            </p>
+{dnsLookupResult && (
+  <div className="mt-5 space-y-4">
+    <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
+      <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+        RESPONSE TIME
+      </p>
+
+      <p className="mt-2 font-mono text-lg">
+        {dnsLookupResult.response_time_ms.toFixed(2)} ms
+      </p>
+    </div>
+
+    <div className="space-y-2">
+      {dnsLookupResult.records.length > 0 ? (
+        dnsLookupResult.records.map((record, index) => (
+          <div
+            key={`${record}-${index}`}
+            className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+          >
+            <p className="break-all font-mono text-xs">{record}</p>
           </div>
-        )}
-      </div>
-    )}
+        ))
+      ) : (
+        <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
+          <p className="font-mono text-xs text-[#9D8589]">
+            No records found.
+          </p>
+        </div>
+      )}
+    </div>
+  </div>
+)}
   </Card>
 </section>
 

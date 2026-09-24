@@ -61,6 +61,7 @@ struct DnsLookupResult {
     name: String,
     record_type: String,
     records: Vec<String>,
+    response_time_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,6 +441,7 @@ async fn dns_lookup(
 ) -> Result<DnsLookupResult, String> {
     use hickory_resolver::proto::rr::RecordType;
     use hickory_resolver::TokioResolver;
+    use std::time::Instant;
 
     let record_type = match record_type.to_uppercase().as_str() {
         "A" => RecordType::A,
@@ -457,10 +459,14 @@ async fn dns_lookup(
         .build()
         .map_err(|error| error.to_string())?;
 
+    let start = Instant::now();
+
     let response = resolver
         .lookup(name.as_str(), record_type)
         .await
         .map_err(|error| error.to_string())?;
+
+    let response_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let records = response
         .answers()
@@ -472,6 +478,7 @@ async fn dns_lookup(
         name,
         record_type: record_type.to_string(),
         records,
+        response_time_ms,
     })
 }
 
