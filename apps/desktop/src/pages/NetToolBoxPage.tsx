@@ -1396,7 +1396,21 @@ async function handleHttpDiagnostic() {
 
             <div className="min-w-0">
               <p className="text-[10px] text-[#9D8589]">STATE</p>
-              <p className="mt-1">{neighbor.state}</p>
+
+              <span
+                className={`mt-1 inline-flex items-center gap-2 rounded-md border px-2.5 py-1 font-mono text-[11px] ${
+                  neighbor.state === "Reachable"
+                    ? "border-[#315B43] bg-[#14241B] text-[#8DBB9D]"
+                    : neighbor.state === "Stale"
+                      ? "border-[#6B512F] bg-[#251C12] text-[#C89A65]"
+                      : neighbor.state === "Failed"
+                        ? "border-[#6B2732] bg-[#281117] text-[#D45767]"
+                        : "border-[#3B171D] bg-[#170A0D] text-[#9D8589]"
+                }`}
+              >
+                <span className="text-[9px]">●</span>
+                {neighbor.state}
+              </span>
             </div>
           </div>
         </div>
