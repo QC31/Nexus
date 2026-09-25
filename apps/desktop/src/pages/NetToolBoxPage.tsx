@@ -52,6 +52,7 @@ interface PingResult {
 interface PingSample {
   timestamp: number;
   latency_ms: number | null;
+  packet_loss: number;
   success: boolean;
 }
 
@@ -293,9 +294,11 @@ async function handlePing() {
         {
           timestamp: Date.now(),
           latency_ms: result.avg_ms,
+          packet_loss: result.packet_loss,
           success: result.packet_loss < 100,
         },
       ]);
+
     } catch (error) {
       setPingError(String(error));
 
@@ -304,9 +307,11 @@ async function handlePing() {
         {
           timestamp: Date.now(),
           latency_ms: null,
+          packet_loss: 100,
           success: false,
         },
       ]);
+
     } finally {
       setIsPinging(false);
     }
@@ -655,6 +660,124 @@ async function handleHttpDiagnostic() {
           fontFamily="monospace"
         >
           0 ms
+        </text>
+      </svg>
+    </div>
+  </div>
+)}
+
+{pingHistory.length > 0 && (
+  <div className="mt-5 border-t border-[#3B171D] pt-5">
+    <div className="flex items-center justify-between">
+      <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+        PACKET LOSS HISTORY
+      </p>
+
+      <span className="font-mono text-[10px] text-[#6F5A5E]">
+        {pingHistory.length} samples
+      </span>
+    </div>
+
+    <div className="mt-4 overflow-hidden rounded-md border border-[#3B171D] bg-[#170A0D]">
+      <svg
+        viewBox="0 0 800 240"
+        className="h-60 w-full"
+        role="img"
+        aria-label="Packet loss history"
+      >
+        <line
+          x1="48"
+          y1="24"
+          x2="48"
+          y2="210"
+          stroke="#3B171D"
+          strokeWidth="1"
+        />
+
+        <line
+          x1="48"
+          y1="210"
+          x2="780"
+          y2="210"
+          stroke="#3B171D"
+          strokeWidth="1"
+        />
+
+        <line
+          x1="48"
+          y1="117"
+          x2="780"
+          y2="117"
+          stroke="#3B171D"
+          strokeWidth="1"
+          strokeDasharray="4 4"
+        />
+
+        {pingHistory.slice(-20).map((sample, index, samples) => {
+          const x =
+            samples.length === 1
+              ? 414
+              : 48 + (index / (samples.length - 1)) * 732;
+
+          const y = 210 - (sample.packet_loss / 100) * 186;
+
+          return (
+            <g key={`loss-${sample.timestamp}-${index}`}>
+              <circle
+                cx={x}
+                cy={y}
+                r="4"
+                fill={sample.packet_loss === 0 ? "#8DBB9D" : "#D45767"}
+              />
+
+              {index > 0 && (
+                <line
+                  x1={
+                    48 +
+                    ((index - 1) / (samples.length - 1)) * 732
+                  }
+                  y1={
+                    210 -
+                    (samples[index - 1].packet_loss / 100) * 186
+                  }
+                  x2={x}
+                  y2={y}
+                  stroke="#8F1826"
+                  strokeWidth="2"
+                />
+              )}
+            </g>
+          );
+        })}
+
+        <text
+          x="12"
+          y="30"
+          fill="#9D8589"
+          fontSize="10"
+          fontFamily="monospace"
+        >
+          100%
+        </text>
+
+        <text
+          x="20"
+          y="122"
+          fill="#9D8589"
+          fontSize="10"
+          fontFamily="monospace"
+        >
+          50%
+        </text>
+
+        <text
+          x="26"
+          y="215"
+          fill="#9D8589"
+          fontSize="10"
+          fontFamily="monospace"
+        >
+          0%
         </text>
       </svg>
     </div>
