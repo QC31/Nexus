@@ -2,12 +2,21 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card } from "../components/ui/Card";
 
+interface Ipv6AddressInfo {
+  address: string;
+  is_temporary: boolean;
+  is_link_local: boolean;
+}
+
 interface NetworkInterfaceInfo {
   name: string;
   ipv4_addresses: string[];
-  ipv6_addresses: string[];
+  ipv6_addresses: Ipv6AddressInfo[];
   is_up: boolean;
   is_loopback: boolean;
+  wifi_ssid: string | null;
+  wifi_rx_bitrate_mbps: number | null;
+  wifi_tx_bitrate_mbps: number | null;
 }
 
 interface NetworkRouteInfo {
@@ -52,6 +61,20 @@ interface DnsLookupResult {
   record_type: string;
   records: string[];
   response_time_ms: number;
+}
+
+interface DnsComparisonServerResult {
+  server: string;
+  response_time_ms: number | null;
+  records: string[];
+  error: string | null;
+  records_match: boolean | null;
+}
+
+interface DnsComparisonResult {
+  name: string;
+  record_type: string;
+  results: DnsComparisonServerResult[];
 }
 
 interface ReverseDnsResult {
@@ -104,6 +127,10 @@ export function NetToolBoxPage() {
   const [routes, setRoutes] = useState<NetworkRouteInfo[]>([]);
   const [dnsInfo, setDnsInfo] = useState<DnsInfo | null>(null);
   const [neighbors, setNeighbors] = useState<NetworkNeighborInfo[]>([]);
+  const [neighborSearch, setNeighborSearch] = useState("");
+  const [neighborInterfaceFilter, setNeighborInterfaceFilter] = useState("all");
+  const [neighborSort, setNeighborSort] = useState<"ip" | "mac" | "state">("ip");
+  const [isRefreshingNeighbors, setIsRefreshingNeighbors] = useState(false);
   const [pingTarget, setPingTarget] = useState("192.168.1.254");
   const [pingResult, setPingResult] = useState<PingResult | null>(null);
   const [pingError, setPingError] = useState("");
@@ -119,6 +146,12 @@ export function NetToolBoxPage() {
   const [isTracerouting, setIsTracerouting] = useState(false);
   const [dnsLookupName, setDnsLookupName] = useState("example.com");
   const [dnsLookupType, setDnsLookupType] = useState("A");
+  const [dnsServerMode, setDnsServerMode] = useState("system");
+  const [dnsServer, setDnsServer] = useState("");
+  const [dnsComparisonResult, setDnsComparisonResult] =
+    useState<DnsComparisonResult | null>(null);
+  const [dnsComparisonError, setDnsComparisonError] = useState("");
+  const [isDnsComparing, setIsDnsComparing] = useState(false);
   const [dnsLookupResult, setDnsLookupResult] = useState<DnsLookupResult | null>(null);
   const [dnsLookupError, setDnsLookupError] = useState("");
   const [isDnsLookingUp, setIsDnsLookingUp] = useState(false);
@@ -133,32 +166,87 @@ export function NetToolBoxPage() {
   const [isHttpChecking, setIsHttpChecking] = useState(false);
   console.log("NEXUS neighbors:", neighbors);
 
-  useEffect(() => {
+useEffect(() => {
+  const loadInterfaces = () => {
     invoke<NetworkInterfaceInfo[]>("network_interfaces")
       .then(setInterfaces)
       .catch((error) => {
         setError(String(error));
       });
+  };
 
-      invoke<NetworkRouteInfo[]>("network_routes")
-        .then(setRoutes)
-        .catch((error) => {
-        console.error("Failed to load network routes:", error);
+  loadInterfaces();
+
+  const interfacesInterval = window.setInterval(loadInterfaces, 2000);
+
+  invoke<NetworkRouteInfo[]>("network_routes")
+    .then(setRoutes)
+    .catch((error) => {
+      console.error("Failed to load network routes:", error);
+    });
+
+  invoke<NetworkNeighborInfo[]>("network_neighbors")
+    .then(setNeighbors)
+    .catch((error) => {
+      console.error("Failed to load network neighbors:", error);
+    });
+
+  invoke<DnsInfo>("dns_info")
+    .then(setDnsInfo)
+    .catch((error) => {
+      console.error("Failed to load DNS information:", error);
+    });
+
+  return () => {
+    window.clearInterval(interfacesInterval);
+  };
+}, []);
+
+const neighborInterfaces = Array.from(
+  new Set(neighbors.map((neighbor) => neighbor.interface_name)),
+).sort();
+
+const filteredNeighbors = [...neighbors]
+  .filter((neighbor) => {
+    const search = neighborSearch.trim().toLowerCase();
+
+    const matchesSearch =
+      search === "" ||
+      neighbor.ip_address.toLowerCase().includes(search) ||
+      (neighbor.mac_address?.toLowerCase().includes(search) ?? false);
+
+    const matchesInterface =
+      neighborInterfaceFilter === "all" ||
+      neighbor.interface_name === neighborInterfaceFilter;
+
+    return matchesSearch && matchesInterface;
+  })
+  .sort((a, b) => {
+    if (neighborSort === "mac") {
+      return (a.mac_address ?? "").localeCompare(b.mac_address ?? "");
+    }
+
+    if (neighborSort === "state") {
+      return a.state.localeCompare(b.state);
+    }
+
+    return a.ip_address.localeCompare(b.ip_address, undefined, {
+      numeric: true,
+    });
   });
 
-      invoke<NetworkNeighborInfo[]>("network_neighbors")
-        .then(setNeighbors)
-        .catch((error) => {
-        console.error("Failed to load network neighbors:", error);
-  });
+const handleRefreshNeighbors = async () => {
+  setIsRefreshingNeighbors(true);
 
-      invoke<DnsInfo>("dns_info")
-        .then(setDnsInfo)
-        .catch((error) => {
-        console.error("Failed to load DNS information:", error);
-  });
-
-  }, []);
+  try {
+    const result = await invoke<NetworkNeighborInfo[]>("network_neighbors");
+    setNeighbors(result);
+  } catch (error) {
+    console.error("Failed to refresh network neighbors:", error);
+  } finally {
+    setIsRefreshingNeighbors(false);
+  }
+};
 
   async function handlePing() {
   if (!pingTarget.trim()) {
@@ -251,13 +339,44 @@ async function handleDnsLookup() {
     const result = await invoke<DnsLookupResult>("dns_lookup", {
       name: dnsLookupName.trim(),
       recordType: dnsLookupType,
-  });
+      dnsServer:
+        dnsServerMode === "system"
+        ? null
+        : dnsServerMode === "custom"
+        ? dnsServer.trim()
+        : dnsServerMode,
+    });
 
     setDnsLookupResult(result);
   } catch (error) {
     setDnsLookupError(String(error));
   } finally {
     setIsDnsLookingUp(false);
+  }
+}
+
+async function handleDnsComparison() {
+  if (!dnsLookupName.trim()) {
+    setDnsComparisonError("Enter a domain.");
+    return;
+  }
+
+  setIsDnsComparing(true);
+  setDnsComparisonError("");
+  setDnsComparisonResult(null);
+
+  try {
+    const result = await invoke<DnsComparisonResult>("dns_compare", {
+      name: dnsLookupName.trim(),
+      recordType: dnsLookupType,
+      dnsServers: ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
+    });
+
+    setDnsComparisonResult(result);
+  } catch (error) {
+    setDnsComparisonError(String(error));
+  } finally {
+    setIsDnsComparing(false);
   }
 }
 
@@ -527,56 +646,106 @@ async function handleHttpDiagnostic() {
   <Card>
     <div className="mb-5">
       <p className="text-xs tracking-[0.2em] text-[#9D8589]">DNS</p>
+
       <h2 className="mt-2 text-lg font-semibold">DNS Lookup</h2>
+
       <p className="mt-1 text-sm text-[#9D8589]">
         Query DNS records for a domain.
       </p>
     </div>
 
-    <div className="flex flex-col gap-3 lg:flex-row">
+    <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_140px_220px_auto]">
       <input
         type="text"
         value={dnsLookupName}
         onChange={(event) => setDnsLookupName(event.target.value)}
         placeholder="example.com"
-        className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
+        className="min-w-0 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
       />
 
       <div className="relative">
-  <label htmlFor="dns-record-type" className="sr-only">
-    DNS record type
-  </label>
+        <label htmlFor="dns-record-type" className="sr-only">
+          DNS record type
+        </label>
 
-  <select
-    id="dns-record-type"
-    value={dnsLookupType}
-    onChange={(event) => setDnsLookupType(event.target.value)}
-    className="w-full appearance-none rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 pr-10 font-mono text-sm font-semibold text-[#EEE5E6] outline-none focus:border-[#B52636] focus:ring-1 focus:ring-[#8F1826]"
-  >
-    <option value="A">A</option>
-    <option value="AAAA">AAAA</option>
-    <option value="CNAME">CNAME</option>
-    <option value="MX">MX</option>
-    <option value="NS">NS</option>
-    <option value="TXT">TXT</option>
-    <option value="SOA">SOA</option>
-  </select>
+        <select
+          id="dns-record-type"
+          value={dnsLookupType}
+          onChange={(event) => setDnsLookupType(event.target.value)}
+          className="w-full appearance-none rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 pr-10 font-mono text-sm font-semibold text-[#EEE5E6] outline-none focus:border-[#B52636] focus:ring-1 focus:ring-[#8F1826]"
+        >
+          <option value="A">A</option>
+          <option value="AAAA">AAAA</option>
+          <option value="CNAME">CNAME</option>
+          <option value="MX">MX</option>
+          <option value="NS">NS</option>
+          <option value="TXT">TXT</option>
+          <option value="SOA">SOA</option>
+        </select>
 
-  <div className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#B52636]">
-    <svg
-      className="h-4 w-4"
-      viewBox="0 0 20 20"
-      fill="currentColor"
-      aria-hidden="true"
-    >
-      <path
-        fillRule="evenodd"
-        d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
-        clipRule="evenodd"
-      />
-    </svg>
-  </div>
-</div>
+        <div className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#B52636]">
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path
+              fillRule="evenodd"
+              d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
+              clipRule="evenodd"
+            />
+          </svg>
+        </div>
+      </div>
+
+      <div className="relative">
+        <label htmlFor="dns-server" className="sr-only">
+          DNS server
+        </label>
+
+        <select
+          id="dns-server"
+          value={dnsServerMode}
+          onChange={(event) => setDnsServerMode(event.target.value)}
+          className="w-full appearance-none rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 pr-10 text-sm text-[#EEE5E6] outline-none focus:border-[#B52636] focus:ring-1 focus:ring-[#8F1826]"
+        >
+          <option value="system" className="bg-[#1D0D11] text-[#EEE5E6]">
+            System DNS
+          </option>
+
+          <option value="1.1.1.1" className="bg-[#1D0D11] text-[#EEE5E6]">
+            Cloudflare — 1.1.1.1
+          </option>
+
+          <option value="8.8.8.8" className="bg-[#1D0D11] text-[#EEE5E6]">
+            Google — 8.8.8.8
+          </option>
+
+          <option value="9.9.9.9" className="bg-[#1D0D11] text-[#EEE5E6]">
+            Quad9 — 9.9.9.9
+          </option>
+
+          <option value="custom" className="bg-[#1D0D11] text-[#EEE5E6]">
+            Custom
+          </option>
+        </select>
+
+        <div className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#B52636]">
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path
+              fillRule="evenodd"
+              d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1-.02-1.06Z"
+              clipRule="evenodd"
+            />
+          </svg>
+        </div>
+      </div>
 
       <button
         type="button"
@@ -586,7 +755,36 @@ async function handleHttpDiagnostic() {
       >
         {isDnsLookingUp ? "LOOKING UP..." : "LOOKUP"}
       </button>
+
+      <button
+        type="button"
+        onClick={handleDnsComparison}
+        disabled={isDnsComparing}
+        className="rounded-md border border-[#542028] bg-[#1D0D11] px-6 py-3 text-sm font-medium text-[#EEE5E6] transition-colors hover:border-[#8F1826] hover:bg-[#6F111C] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isDnsComparing ? "COMPARING..." : "RUN COMPARISON"}
+      </button>
     </div>
+
+    {dnsServerMode === "custom" && (
+      <div className="mt-3">
+        <label
+          htmlFor="custom-dns-server"
+          className="mb-2 block text-[10px] tracking-[0.15em] text-[#9D8589]"
+        >
+          CUSTOM DNS SERVER
+        </label>
+
+        <input
+          id="custom-dns-server"
+          type="text"
+          value={dnsServer}
+          onChange={(event) => setDnsServer(event.target.value)}
+          placeholder="192.168.1.1"
+          className="w-full rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5A5E] focus:border-[#B52636]"
+        />
+      </div>
+    )}
 
     {dnsLookupError && (
       <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
@@ -594,35 +792,100 @@ async function handleHttpDiagnostic() {
       </p>
     )}
 
-{dnsLookupResult && (
-  <div className="mt-5 space-y-4">
-    <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
-      <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
-        RESPONSE TIME
+    {dnsLookupResult && (
+      <div className="mt-5 space-y-4">
+        <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
+          <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+            RESPONSE TIME
+          </p>
+
+          <p className="mt-2 font-mono text-lg">
+            {dnsLookupResult.response_time_ms.toFixed(2)} ms
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          {dnsLookupResult.records.length > 0 ? (
+            dnsLookupResult.records.map((record, index) => (
+              <div
+                key={`${record}-${index}`}
+                className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+              >
+                <p className="break-all font-mono text-xs">{record}</p>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
+              <p className="font-mono text-xs text-[#9D8589]">
+                No records found.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    )}
+
+
+    {dnsComparisonError && (
+  <p className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm text-[#D45767]">
+    {dnsComparisonError}
+  </p>
+)}
+
+{dnsComparisonResult && (
+  <div className="mt-5 rounded-lg border border-[#3B171D] bg-[#170A0D] p-5">
+    <div className="mb-4">
+      <p className="text-xs tracking-[0.15em] text-[#9D8589]">
+        DNS COMPARISON
       </p>
 
-      <p className="mt-2 font-mono text-lg">
-        {dnsLookupResult.response_time_ms.toFixed(2)} ms
+      <p className="mt-2 font-mono text-sm">
+        {dnsComparisonResult.name}
+        <span className="ml-2 text-[#9D8589]">
+          / {dnsComparisonResult.record_type}
+        </span>
       </p>
     </div>
 
     <div className="space-y-2">
-      {dnsLookupResult.records.length > 0 ? (
-        dnsLookupResult.records.map((record, index) => (
-          <div
-            key={`${record}-${index}`}
-            className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
-          >
-            <p className="break-all font-mono text-xs">{record}</p>
+      {dnsComparisonResult.results.map((result) => (
+        <div
+          key={result.server}
+          className="flex flex-col gap-3 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div>
+            <p className="font-mono text-sm">{result.server}</p>
+
+            {result.error && (
+              <p className="mt-1 text-xs text-[#D45767]">
+                {result.error}
+              </p>
+            )}
           </div>
-        ))
-      ) : (
-        <div className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3">
-          <p className="font-mono text-xs text-[#9D8589]">
-            No records found.
-          </p>
+
+
+      <div className="flex items-center gap-3">
+        <div className="font-mono text-sm">
+          {result.response_time_ms !== null
+            ? `${result.response_time_ms.toFixed(2)} ms`
+            : "FAILED"}
         </div>
-      )}
+
+        {result.records_match !== null && (
+          <span
+            className={
+              result.records_match
+                ? "rounded border border-[#3B171D] bg-[#170A0D] px-2 py-1 text-[10px] font-semibold tracking-[0.12em] text-[#8DBB9D]"
+                : "rounded border border-[#542028] bg-[#1D0D11] px-2 py-1 text-[10px] font-semibold tracking-[0.12em] text-[#D45767]"
+            }
+          >
+            {result.records_match ? "MATCH" : "DIFFERENT"}
+          </span>
+        )}
+    </div>
+
+        </div>
+      ))}
     </div>
   </div>
 )}
@@ -937,25 +1200,55 @@ async function handleHttpDiagnostic() {
                 </div>
 
                 <div className="mt-4 space-y-2 font-mono text-xs">
+                  
                   {networkInterface.ipv4_addresses.map((address) => (
                     <div
                       key={`ipv4-${address}`}
-                      className="flex items-center gap-3"
+                      className="grid grid-cols-[5rem_minmax(0,1fr)] items-start gap-3"
                     >
-                      <span className="w-10 text-[#9D8589]">IPv4</span>
-                      <span>{address}</span>
-                    </div>
-                  ))}
-
-                  {networkInterface.ipv6_addresses.map((address) => (
-                    <div
-                      key={`ipv6-${address}`}
-                      className="flex items-center gap-3"
-                    >
-                      <span className="w-10 text-[#9D8589]">IPv6</span>
+                      <span className="text-[#9D8589]">IPv4</span>
                       <span className="break-all">{address}</span>
                     </div>
                   ))}
+
+                  {networkInterface.ipv6_addresses.map((addressInfo) => {
+                    const label = addressInfo.is_link_local
+                      ? "IPv6 LL"
+                      : addressInfo.is_temporary
+                        ? "IPv6 TEMP"
+                        : "IPv6";
+
+                    return (
+                      <div
+                        key={`ipv6-${addressInfo.address}`}
+                        className="grid grid-cols-[5rem_minmax(0,1fr)] items-start gap-3"
+                      >
+                        <span className="whitespace-nowrap text-[#9D8589]">{label}</span>
+                        <span className="break-all">{addressInfo.address}</span>
+                      </div>
+                    );
+                  })}
+
+                  {networkInterface.wifi_rx_bitrate_mbps !== null && (
+                    <div className="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-3">
+                      <span className="text-[#9D8589]">RX</span>
+                      <span>{networkInterface.wifi_rx_bitrate_mbps.toFixed(1)} Mbps</span>
+                    </div>
+                  )}
+
+                  {networkInterface.wifi_tx_bitrate_mbps !== null && (
+                    <div className="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-3">
+                      <span className="text-[#9D8589]">TX</span>
+                      <span>{networkInterface.wifi_tx_bitrate_mbps.toFixed(1)} Mbps</span>
+                    </div>
+                  )}
+
+                  {networkInterface.wifi_ssid !== null && (
+                    <div className="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-3">
+                      <span className="text-[#9D8589]">SSID</span>
+                      <span className="break-all">{networkInterface.wifi_ssid}</span>
+                    </div>
+                  )}
 
                   {networkInterface.ipv4_addresses.length === 0 &&
                     networkInterface.ipv6_addresses.length === 0 && (
@@ -980,6 +1273,184 @@ async function handleHttpDiagnostic() {
             )}
           </div>
         </Card>
+
+        <Card>
+  <div className="flex items-center justify-between">
+    <p className="text-xs text-[#9D8589]">NETWORK NEIGHBORS</p>
+
+    <span className="font-mono text-xs text-[#9D8589]">
+      {filteredNeighbors.length} detected
+    </span>
+  </div>
+
+  <div className="mt-4 grid gap-3 md:grid-cols-2">
+    <input
+      type="text"
+      value={neighborSearch}
+      onChange={(event) => setNeighborSearch(event.target.value)}
+      placeholder="Search by IP or MAC..."
+      className="w-full rounded-md border border-[#3B171D] bg-[#170A0D] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none transition-colors placeholder:text-[#6F5A5E] focus:border-[#8F1826]"
+    />
+
+    <div className="grid grid-cols-2 gap-2">
+  <button
+    type="button"
+    onClick={() => setNeighborInterfaceFilter("all")}
+    className={`rounded-md border px-3 py-3 text-sm transition-colors ${
+      neighborInterfaceFilter === "all"
+        ? "border-[#8F1826] bg-[#6F111C] text-[#EEE5E6]"
+        : "border-[#3B171D] bg-[#170A0D] text-[#9D8589] hover:border-[#542028] hover:text-[#EEE5E6]"
+    }`}
+  >
+    All interfaces
+  </button>
+
+  {neighborInterfaces.map((interfaceName) => (
+    <button
+      key={interfaceName}
+      type="button"
+      onClick={() => setNeighborInterfaceFilter(interfaceName)}
+      className={`rounded-md border px-3 py-3 font-mono text-sm transition-colors ${
+        neighborInterfaceFilter === interfaceName
+          ? "border-[#8F1826] bg-[#6F111C] text-[#EEE5E6]"
+          : "border-[#3B171D] bg-[#170A0D] text-[#9D8589] hover:border-[#542028] hover:text-[#EEE5E6]"
+      }`}
+    >
+      {interfaceName}
+    </button>
+  ))}
+</div>
+
+    <div className="grid grid-cols-3 gap-2">
+  <button
+    type="button"
+    onClick={() => setNeighborSort("ip")}
+    className={`rounded-md border px-3 py-3 text-sm transition-colors ${
+      neighborSort === "ip"
+        ? "border-[#8F1826] bg-[#6F111C] text-[#EEE5E6]"
+        : "border-[#3B171D] bg-[#170A0D] text-[#9D8589] hover:border-[#542028] hover:text-[#EEE5E6]"
+    }`}
+  >
+    IP
+  </button>
+
+  <button
+    type="button"
+    onClick={() => setNeighborSort("mac")}
+    className={`rounded-md border px-3 py-3 text-sm transition-colors ${
+      neighborSort === "mac"
+        ? "border-[#8F1826] bg-[#6F111C] text-[#EEE5E6]"
+        : "border-[#3B171D] bg-[#170A0D] text-[#9D8589] hover:border-[#542028] hover:text-[#EEE5E6]"
+    }`}
+  >
+    MAC
+  </button>
+
+  <button
+    type="button"
+    onClick={() => setNeighborSort("state")}
+    className={`rounded-md border px-3 py-3 text-sm transition-colors ${
+      neighborSort === "state"
+        ? "border-[#8F1826] bg-[#6F111C] text-[#EEE5E6]"
+        : "border-[#3B171D] bg-[#170A0D] text-[#9D8589] hover:border-[#542028] hover:text-[#EEE5E6]"
+    }`}
+  >
+    State
+  </button>
+</div>
+
+    <button
+      type="button"
+      onClick={handleRefreshNeighbors}
+      disabled={isRefreshingNeighbors}
+      className="w-full rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-sm font-medium text-[#EEE5E6] transition-colors hover:border-[#8F1826] hover:bg-[#250F14] disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {isRefreshingNeighbors ? "Refreshing..." : "Refresh"}
+    </button>
+  </div>
+
+  {filteredNeighbors.length > 0 ? (
+    <div className="mt-4 space-y-2">
+      {filteredNeighbors.map((neighbor) => (
+        <div
+          key={`${neighbor.ip_address}-${neighbor.mac_address ?? "unknown"}`}
+          className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+        >
+          <div className="grid grid-cols-1 gap-4 font-mono text-xs sm:grid-cols-2">
+            <div className="min-w-0">
+              <p className="text-[10px] text-[#9D8589]">IP ADDRESS</p>
+              <p className="mt-1 break-all">{neighbor.ip_address}</p>
+            </div>
+
+            <div className="min-w-0">
+              <p className="text-[10px] text-[#9D8589]">MAC ADDRESS</p>
+              <p className="mt-1 break-all text-[#9D8589]">
+                {neighbor.mac_address ?? "—"}
+              </p>
+            </div>
+
+            <div className="min-w-0">
+              <p className="text-[10px] text-[#9D8589]">INTERFACE</p>
+              <p className="mt-1">{neighbor.interface_name}</p>
+            </div>
+
+            <div className="min-w-0">
+              <p className="text-[10px] text-[#9D8589]">STATE</p>
+              <p className="mt-1">{neighbor.state}</p>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  ) : (
+    <p className="mt-4 text-sm text-[#9D8589]">
+      {neighbors.length > 0
+        ? "No neighbors match the current filters."
+        : "No network neighbors detected."}
+    </p>
+  )}
+</Card>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
         <Card>
           <p className="text-xs text-[#9D8589]">NETWORK ROUTES</p>
@@ -1046,50 +1517,6 @@ async function handleHttpDiagnostic() {
       Loading DNS configuration...
     </p>
   )}
-</div>
-
-<div className="mt-6 border-t border-[#3B171D] pt-5">
-  <p className="text-xs text-[#9D8589]">NETWORK NEIGHBORS</p>
-
-{neighbors.length > 0 ? (
-  <div className="mt-4 space-y-2">
-    {neighbors.map((neighbor) => (
-  <div
-    key={`${neighbor.ip_address}-${neighbor.mac_address ?? "unknown"}`}
-    className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
-  >
-    <div className="grid grid-cols-1 gap-4 font-mono text-xs sm:grid-cols-2">
-      <div className="min-w-0">
-        <p className="text-[10px] text-[#9D8589]">IP ADDRESS</p>
-        <p className="mt-1 break-all">{neighbor.ip_address}</p>
-      </div>
-
-      <div className="min-w-0">
-        <p className="text-[10px] text-[#9D8589]">MAC ADDRESS</p>
-        <p className="mt-1 break-all text-[#9D8589]">
-          {neighbor.mac_address ?? "—"}
-        </p>
-      </div>
-
-      <div className="min-w-0">
-        <p className="text-[10px] text-[#9D8589]">INTERFACE</p>
-        <p className="mt-1">{neighbor.interface_name}</p>
-      </div>
-
-      <div className="min-w-0">
-        <p className="text-[10px] text-[#9D8589]">STATE</p>
-        <p className="mt-1">{neighbor.state}</p>
-      </div>
-    </div>
-  </div>
-))}
-  </div>
-) : (
-  <p className="mt-4 text-sm text-[#9D8589]">
-    No network neighbors detected.
-  </p>
-)}
-
 </div>
 
 </div>

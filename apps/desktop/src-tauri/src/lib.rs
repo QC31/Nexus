@@ -6,12 +6,22 @@ use rtnetlink::new_connection;
 use rtnetlink::packet_route::route::RouteAttribute;
 
 #[derive(Debug, Serialize)]
+struct Ipv6AddressInfo {
+    address: String,
+    is_temporary: bool,
+    is_link_local: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct NetworkInterfaceInfo {
     name: String,
     ipv4_addresses: Vec<String>,
-    ipv6_addresses: Vec<String>,
+    ipv6_addresses: Vec<Ipv6AddressInfo>,
     is_up: bool,
     is_loopback: bool,
+    wifi_ssid: Option<String>,
+    wifi_rx_bitrate_mbps: Option<f64>,
+    wifi_tx_bitrate_mbps: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +72,22 @@ struct DnsLookupResult {
     record_type: String,
     records: Vec<String>,
     response_time_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsComparisonResult {
+    name: String,
+    record_type: String,
+    results: Vec<DnsComparisonServerResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsComparisonServerResult {
+    server: String,
+    response_time_ms: Option<f64>,
+    records: Vec<String>,
+    error: Option<String>,
+    records_match: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,9 +464,12 @@ fn tcp_check(target: String, port: u16) -> Result<TcpCheckResult, String> {
 async fn dns_lookup(
     name: String,
     record_type: String,
+    dns_server: Option<String>,
 ) -> Result<DnsLookupResult, String> {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
     use hickory_resolver::proto::rr::RecordType;
     use hickory_resolver::TokioResolver;
+    use std::net::IpAddr;
     use std::time::Instant;
 
     let record_type = match record_type.to_uppercase().as_str() {
@@ -454,10 +483,29 @@ async fn dns_lookup(
         _ => return Err("Unsupported DNS record type".to_string()),
     };
 
-    let resolver = TokioResolver::builder_tokio()
-        .map_err(|error| error.to_string())?
-        .build()
-        .map_err(|error| error.to_string())?;
+    let resolver = if let Some(dns_server) = dns_server {
+        let ip: IpAddr = dns_server
+            .trim()
+            .parse()
+            .map_err(|error| format!("Invalid DNS server: {error}"))?;
+
+        let name_server = NameServerConfig::udp(ip);
+
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            vec![name_server],
+        );
+
+        TokioResolver::builder_with_config(config, Default::default())
+            .build()
+            .map_err(|error| error.to_string())?
+    } else {
+        TokioResolver::builder_tokio()
+            .map_err(|error| error.to_string())?
+            .build()
+            .map_err(|error| error.to_string())?
+    };
 
     let start = Instant::now();
 
@@ -479,6 +527,141 @@ async fn dns_lookup(
         record_type: record_type.to_string(),
         records,
         response_time_ms,
+    })
+}
+
+#[tauri::command]
+async fn dns_compare(
+    name: String,
+    record_type: String,
+    dns_servers: Vec<String>,
+) -> Result<DnsComparisonResult, String> {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::proto::rr::RecordType;
+    use hickory_resolver::TokioResolver;
+    use std::net::IpAddr;
+    use std::time::Instant;
+
+    let record_type = match record_type.to_uppercase().as_str() {
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "CNAME" => RecordType::CNAME,
+        "MX" => RecordType::MX,
+        "NS" => RecordType::NS,
+        "TXT" => RecordType::TXT,
+        "SOA" => RecordType::SOA,
+        _ => return Err("Unsupported DNS record type".to_string()),
+    };
+
+    if dns_servers.is_empty() {
+        return Err("No DNS servers provided".to_string());
+    }
+
+    let mut results = Vec::new();
+
+    for dns_server in dns_servers {
+        let ip: IpAddr = match dns_server.trim().parse() {
+            Ok(ip) => ip,
+            Err(error) => {
+                results.push(DnsComparisonServerResult {
+                    server: dns_server,
+                    response_time_ms: None,
+                    records: Vec::new(),
+                    error: Some(format!("Invalid DNS server: {error}")),
+                    records_match: None,
+                });
+
+                continue;
+            }
+        };
+
+        let name_server = NameServerConfig::udp(ip);
+
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            vec![name_server],
+        );
+
+        let resolver = match TokioResolver::builder_with_config(config, Default::default())
+            .build()
+        {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                results.push(DnsComparisonServerResult {
+                    server: ip.to_string(),
+                    response_time_ms: None,
+                    records: Vec::new(),
+                    error: Some(error.to_string()),
+                    records_match: None,
+                });
+
+                continue;
+            }
+        };
+
+        let start = Instant::now();
+
+        match resolver.lookup(name.as_str(), record_type).await {
+            Ok(response) => {
+                let response_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                let records = response
+                    .answers()
+                    .iter()
+                    .map(|record| {
+                        record
+                            .data
+                            .to_string()
+                    })
+                .collect::<Vec<_>>();
+
+                results.push(DnsComparisonServerResult {
+                    server: ip.to_string(),
+                    response_time_ms: Some(response_time_ms),
+                    records,
+                    error: None,
+                    records_match: None,
+                });
+            }
+            Err(error) => {
+                results.push(DnsComparisonServerResult {
+                    server: ip.to_string(),
+                    response_time_ms: None,
+                    records: Vec::new(),
+                    error: Some(error.to_string()),
+                    records_match: None,
+                });
+            }
+        }
+    }
+
+    let successful_records = results
+        .iter()
+        .filter(|result| result.error.is_none())
+        .map(|result| result.records.clone())
+        .collect::<Vec<_>>();
+
+    let reference_records = successful_records.first();
+
+    if let Some(reference_records) = reference_records {
+        for result in &mut results {
+            if result.error.is_none() {
+                let mut current_records = result.records.clone();
+                let mut reference = reference_records.clone();
+
+                current_records.sort();
+                reference.sort();
+
+                result.records_match = Some(current_records == reference);
+            }
+        }
+    }
+
+    Ok(DnsComparisonResult {
+        name,
+        record_type: record_type.to_string(),
+        results,
     })
 }
 
@@ -584,6 +767,13 @@ fn is_interface_up(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_wifi_bitrate(value: &str) -> Option<f64> {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|number| number.parse::<f64>().ok())
+}
+
 #[tauri::command]
 fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
     let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
@@ -595,12 +785,60 @@ fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
 
         let entry = interfaces_by_name
             .entry(interface.name.clone())
-            .or_insert_with(|| NetworkInterfaceInfo {
-                name: interface.name.clone(),
-                ipv4_addresses: Vec::new(),
-                ipv6_addresses: Vec::new(),
-                is_up: is_interface_up(&interface.name),
-                is_loopback,
+            .or_insert_with(|| {
+                let wifi_info = std::process::Command::new("iw")
+                    .args(["dev", &interface.name, "link"])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| {
+                        let text = String::from_utf8_lossy(&output.stdout);
+
+                        let wifi_ssid = text.lines().find_map(|line| {
+                            line.trim()
+                                .strip_prefix("SSID:")
+                                .map(str::trim)
+                                .map(str::to_string)
+                        });
+
+                        let wifi_rx_bitrate_mbps = text.lines().find_map(|line| {
+                            let line = line.trim();
+
+                            if let Some(value) = line.strip_prefix("rx bitrate:") {
+                                return parse_wifi_bitrate(value);
+                            }
+
+                            None
+                        });
+
+                        let wifi_tx_bitrate_mbps = text.lines().find_map(|line| {
+                            let line = line.trim();
+
+                            if let Some(value) = line.strip_prefix("tx bitrate:") {
+                                return parse_wifi_bitrate(value);
+                            }
+
+                            None
+                        });
+
+                        (
+                            wifi_ssid,
+                            wifi_rx_bitrate_mbps,
+                            wifi_tx_bitrate_mbps,
+                        )
+                    })
+                    .unwrap_or((None, None, None));
+
+                NetworkInterfaceInfo {
+                    name: interface.name.clone(),
+                    ipv4_addresses: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                    is_up: is_interface_up(&interface.name),
+                    is_loopback,
+                    wifi_ssid: wifi_info.0,
+                    wifi_rx_bitrate_mbps: wifi_info.1,
+                    wifi_tx_bitrate_mbps: wifi_info.2,
+                }
             });
 
         match interface.addr.ip() {
@@ -608,7 +846,39 @@ fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
                 entry.ipv4_addresses.push(address.to_string());
             }
             IpAddr::V6(address) => {
-                entry.ipv6_addresses.push(address.to_string());
+                let address_string = address.to_string();
+
+                let ipv6_info = std::process::Command::new("ip")
+                    .args(["-6", "addr", "show", "dev", &interface.name])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| {
+                        let text = String::from_utf8_lossy(&output.stdout);
+
+                        let matching_line = text.lines().find(|line| {
+                            line.trim_start()
+                                .strip_prefix("inet6 ")
+                                .and_then(|value| value.split_whitespace().next())
+                                .and_then(|value| value.split('/').next())
+                                == Some(address_string.as_str())
+                        });
+
+                        let line = matching_line.unwrap_or_default();
+
+                        Ipv6AddressInfo {
+                            address: address_string.clone(),
+                            is_temporary: line.contains("temporary"),
+                            is_link_local: line.contains("scope link"),
+                        }
+                    })
+                    .unwrap_or(Ipv6AddressInfo {
+                        address: address_string.clone(),
+                        is_temporary: false,
+                        is_link_local: address.is_unicast_link_local(),
+                    });
+
+                entry.ipv6_addresses.push(ipv6_info);
             }
         }
     }
@@ -868,6 +1138,7 @@ pub fn run() {
             tcp_check,
             traceroute_host,
             dns_lookup,
+            dns_compare,
             reverse_dns_lookup,
             http_diagnostic
 ])
