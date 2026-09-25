@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card } from "../components/ui/Card";
 
@@ -47,6 +47,12 @@ interface PingResult {
   min_ms: number | null;
   avg_ms: number | null;
   max_ms: number | null;
+}
+
+interface PingSample {
+  timestamp: number;
+  latency_ms: number | null;
+  success: boolean;
 }
 
 interface TcpCheckResult {
@@ -135,6 +141,9 @@ export function NetToolBoxPage() {
   const [pingResult, setPingResult] = useState<PingResult | null>(null);
   const [pingError, setPingError] = useState("");
   const [isPinging, setIsPinging] = useState(false);
+  const [pingHistory, setPingHistory] = useState<PingSample[]>([]);
+  const [isPingMonitoring, setIsPingMonitoring] = useState(false);
+  const pingMonitoringRef = useRef(false);
   const [tcpTarget, setTcpTarget] = useState("127.0.0.1");
   const [tcpPort, setTcpPort] = useState("22");
   const [tcpResult, setTcpResult] = useState<TcpCheckResult | null>(null);
@@ -248,27 +257,71 @@ const handleRefreshNeighbors = async () => {
   }
 };
 
-  async function handlePing() {
+async function handlePing() {
   if (!pingTarget.trim()) {
     setPingError("Enter a target.");
     return;
   }
 
-  setIsPinging(true);
+  if (pingMonitoringRef.current) {
+    pingMonitoringRef.current = false;
+    setIsPingMonitoring(false);
+    setIsPinging(false);
+    return;
+  }
+
+  pingMonitoringRef.current = true;
+  setIsPingMonitoring(true);
   setPingError("");
   setPingResult(null);
+  setPingHistory([]);
 
-  try {
-    const result = await invoke<PingResult>("ping_host", {
-      target: pingTarget.trim(),
+  const target = pingTarget.trim();
+
+  while (pingMonitoringRef.current) {
+    setIsPinging(true);
+
+    try {
+      const result = await invoke<PingResult>("ping_host", {
+        target,
+      });
+
+      setPingResult(result);
+
+      setPingHistory((history) => [
+        ...history.slice(-19),
+        {
+          timestamp: Date.now(),
+          latency_ms: result.avg_ms,
+          success: result.packet_loss < 100,
+        },
+      ]);
+    } catch (error) {
+      setPingError(String(error));
+
+      setPingHistory((history) => [
+        ...history.slice(-19),
+        {
+          timestamp: Date.now(),
+          latency_ms: null,
+          success: false,
+        },
+      ]);
+    } finally {
+      setIsPinging(false);
+    }
+
+    if (!pingMonitoringRef.current) {
+      break;
+    }
+
+    await new Promise((resolve) => {
+      window.setTimeout(resolve, 2000);
     });
-
-    setPingResult(result);
-  } catch (error) {
-    setPingError(String(error));
-  } finally {
-    setIsPinging(false);
   }
+
+  setIsPingMonitoring(false);
+  setIsPinging(false);
 }
 
 async function handleTcpCheck() {
@@ -450,10 +503,10 @@ async function handleHttpDiagnostic() {
       <button
         type="button"
         onClick={handlePing}
-        disabled={isPinging}
+        disabled={isPinging && !isPingMonitoring}
         className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
       >
-        {isPinging ? "PINGING..." : "PING"}
+        {isPingMonitoring ? "STOP MONITORING" : isPinging ? "PINGING..." : "START MONITORING"}
       </button>
     </div>
 
@@ -494,6 +547,120 @@ async function handleHttpDiagnostic() {
         </div>
       </div>
     )}
+
+    {pingHistory.length > 0 && (
+  <div className="mt-5 border-t border-[#3B171D] pt-5">
+    <div className="flex items-center justify-between">
+      <p className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+        LATENCY HISTORY
+      </p>
+
+      <span className="font-mono text-[10px] text-[#6F5A5E]">
+        {pingHistory.length} samples
+      </span>
+    </div>
+
+    <div className="mt-4 overflow-hidden rounded-md border border-[#3B171D] bg-[#170A0D]">
+      <svg
+        viewBox="0 0 800 240"
+        className="h-60 w-full"
+        role="img"
+        aria-label="Ping latency history"
+      >
+        <line
+          x1="48"
+          y1="24"
+          x2="48"
+          y2="210"
+          stroke="#3B171D"
+          strokeWidth="1"
+        />
+
+        <line
+          x1="48"
+          y1="210"
+          x2="780"
+          y2="210"
+          stroke="#3B171D"
+          strokeWidth="1"
+        />
+
+        {pingHistory.slice(-20).map((sample, index, samples) => {
+          const successfulSamples = samples.filter(
+            (item) => item.latency_ms !== null,
+          );
+
+          const maxLatency = Math.max(
+            10,
+            ...successfulSamples.map((item) => item.latency_ms ?? 0),
+          );
+
+          const x =
+            samples.length === 1
+              ? 414
+              : 48 + (index / (samples.length - 1)) * 732;
+
+          const y =
+            sample.latency_ms === null
+              ? 210
+              : 210 - ((sample.latency_ms / maxLatency) * 170);
+
+          return (
+            <g key={`${sample.timestamp}-${index}`}>
+              <circle
+                cx={x}
+                cy={y}
+                r="4"
+                fill={sample.success ? "#B52636" : "#D45767"}
+              />
+
+              {index > 0 &&
+                samples[index - 1].latency_ms !== null &&
+                sample.latency_ms !== null && (
+                  <line
+                    x1={
+                      48 +
+                      ((index - 1) / (samples.length - 1)) * 732
+                    }
+                    y1={
+                      210 -
+                      ((samples[index - 1].latency_ms ?? 0) / maxLatency) *
+                        170
+                    }
+                    x2={x}
+                    y2={y}
+                    stroke="#8F1826"
+                    strokeWidth="2"
+                  />
+                )}
+            </g>
+          );
+        })}
+
+        <text
+          x="12"
+          y="30"
+          fill="#9D8589"
+          fontSize="10"
+          fontFamily="monospace"
+        >
+          MAX
+        </text>
+
+        <text
+          x="20"
+          y="215"
+          fill="#9D8589"
+          fontSize="10"
+          fontFamily="monospace"
+        >
+          0 ms
+        </text>
+      </svg>
+    </div>
+  </div>
+)}
+
   </Card>
 </section>
 
