@@ -5,6 +5,7 @@ const navigationItems = [
   { label: "NetToolBox", path: "/nettoolbox" },
   { label: "IP Calculator++", path: "/ip-calculator" },
   { label: "SSH Manager", path: "/ssh" },
+  { label: "Key Manager", path: "/keys" },
   { label: "Settings", path: "/settings" },
 ];
 

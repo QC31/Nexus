@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Card } from "../components/ui/Card";
 
 interface Ipv6AddressInfo {
@@ -47,6 +48,43 @@ interface PingResult {
   min_ms: number | null;
   avg_ms: number | null;
   max_ms: number | null;
+  jitter_ms: number | null;
+}
+
+interface ConnectivityCheck {
+  name: string;
+  status: 'online' | 'degraded' | 'offline';
+  latency_ms: number | null;
+  detail: string | null;
+}
+
+interface GlobalConnectivityResult {
+  status: 'online' | 'degraded' | 'offline';
+  checks: ConnectivityCheck[];
+}
+
+interface RouteLookupResult {
+  target: string;
+  destination: string;
+  gateway: string | null;
+  interface_name: string | null;
+  metric: number | null;
+}
+
+interface NetworkDiscoveryDevice {
+  ip_address: string;
+  mac_address: string | null;
+  hostname: string | null;
+  vendor: string | null;
+  interface_name: string;
+  state: string;
+  latency_ms: number | null;
+}
+
+interface NetworkDiscoveryProgress {
+  scanned: number;
+  total: number;
+  discovered: number;
 }
 
 interface PingSample {
@@ -61,6 +99,24 @@ interface TcpCheckResult {
   port: number;
   open: boolean;
   connect_time_ms: number | null;
+}
+
+interface PortScanResult {
+  port: number;
+  open: boolean;
+  service: string | null;
+  connect_time_ms: number | null;
+}
+
+interface PortScanProgress {
+  scanned: number;
+  total: number;
+  open_ports: number;
+}
+
+interface PortScanPreset {
+  name: string;
+  ports: number[];
 }
 
 interface DnsLookupResult {
@@ -128,10 +184,115 @@ interface TracerouteHop {
   latency_ms: number | null;
 }
 
+const PORT_SCAN_PRESETS: PortScanPreset[] = [
+  {
+    name: "COMMON",
+    ports: [
+      21,
+      22,
+      23,
+      25,
+      53,
+      80,
+      110,
+      143,
+      443,
+      445,
+      587,
+      993,
+      995,
+      1433,
+      3306,
+      3389,
+      5432,
+      5900,
+      6379,
+      8080,
+    ],
+  },
+  {
+    name: "WEB",
+    ports: [80, 443, 3000, 5000, 8000, 8080, 8443],
+  },
+  {
+    name: "DATABASE",
+    ports: [1433, 3306, 5432, 6379, 27017],
+  },
+  {
+    name: "REMOTE ACCESS",
+    ports: [22, 23, 3389, 5900],
+  },
+];
+
 export function NetToolBoxPage() {
   const [interfaces, setInterfaces] = useState<NetworkInterfaceInfo[]>([]);
   const [error, setError] = useState("");
   const [routes, setRoutes] = useState<NetworkRouteInfo[]>([]);
+  const [discoveredDevices, setDiscoveredDevices] = useState<
+    NetworkDiscoveryDevice[]
+  >([]);
+  const [isDiscovering, setIsDiscovering] = useState(false);
+  const [discoveryProgress, setDiscoveryProgress] =
+    useState<NetworkDiscoveryProgress | null>(null);
+
+    useEffect(() => {
+  let unlisten: (() => void) | null = null;
+
+  const setup = async () => {
+    unlisten = await listen<NetworkDiscoveryProgress>(
+      "network-discovery-progress",
+      (event) => {
+        setDiscoveryProgress(event.payload);
+      },
+    );
+  };
+
+  void setup();
+
+  return () => {
+    unlisten?.();
+  };
+}, []);
+
+useEffect(() => {
+  let unlisten: (() => void) | null = null;
+
+  const setup = async () => {
+    unlisten = await listen<NetworkDiscoveryProgress>(
+      "network-discovery-progress",
+      (event) => {
+        setDiscoveryProgress(event.payload);
+      },
+    );
+  };
+
+  void setup();
+
+  return () => {
+    unlisten?.();
+  };
+}, []);
+
+// LISTENER PORT SCANNER
+useEffect(() => {
+  let unlisten: (() => void) | null = null;
+
+  const setup = async () => {
+    unlisten = await listen<PortScanProgress>(
+      "port-scan-progress",
+      (event) => {
+        setPortScanProgress(event.payload);
+      },
+    );
+  };
+
+  void setup();
+
+  return () => {
+    unlisten?.();
+  };
+}, []);
+
   const [dnsInfo, setDnsInfo] = useState<DnsInfo | null>(null);
   const [neighbors, setNeighbors] = useState<NetworkNeighborInfo[]>([]);
   const [neighborSearch, setNeighborSearch] = useState("");
@@ -140,6 +301,15 @@ export function NetToolBoxPage() {
   const [isRefreshingNeighbors, setIsRefreshingNeighbors] = useState(false);
   const [pingTarget, setPingTarget] = useState("192.168.1.254");
   const [pingResult, setPingResult] = useState<PingResult | null>(null);
+  const [globalConnectivity, setGlobalConnectivity] =
+    useState<GlobalConnectivityResult | null>(null);
+  const [isCheckingConnectivity, setIsCheckingConnectivity] = useState(false);
+  const [connectivityError, setConnectivityError] = useState('');
+  const [routeLookupTarget, setRouteLookupTarget] = useState('');
+  const [routeLookupResult, setRouteLookupResult] =
+    useState<RouteLookupResult | null>(null);
+  const [isLookingUpRoute, setIsLookingUpRoute] = useState(false);
+  const [routeLookupError, setRouteLookupError] = useState('');
   const [pingError, setPingError] = useState("");
   const [isPinging, setIsPinging] = useState(false);
   const [pingHistory, setPingHistory] = useState<PingSample[]>([]);
@@ -174,7 +344,13 @@ export function NetToolBoxPage() {
   const [httpResult, setHttpResult] = useState<HttpDiagnosticResult | null>(null);
   const [httpError, setHttpError] = useState("");
   const [isHttpChecking, setIsHttpChecking] = useState(false);
-  console.log("NEXUS neighbors:", neighbors);
+  const [portScanTarget, setPortScanTarget] = useState("");
+  const [portScanResults, setPortScanResults] = useState<PortScanResult[]>([]);
+  const [isPortScanning, setIsPortScanning] = useState(false);
+  const [portScanProgress, setPortScanProgress] =
+    useState<PortScanProgress | null>(null);
+  const [portScanPreset, setPortScanPreset] = useState("COMMON");
+  const [customPorts, setCustomPorts] = useState("");
 
 useEffect(() => {
   const loadInterfaces = () => {
@@ -211,6 +387,8 @@ useEffect(() => {
     window.clearInterval(interfacesInterval);
   };
 }, []);
+
+
 
 const neighborInterfaces = Array.from(
   new Set(neighbors.map((neighbor) => neighbor.interface_name)),
@@ -257,6 +435,126 @@ const handleRefreshNeighbors = async () => {
     setIsRefreshingNeighbors(false);
   }
 };
+
+const handleNetworkDiscovery = async () => {
+  try {
+    setError("");
+    setIsDiscovering(true);
+    setDiscoveredDevices([]);
+    setDiscoveryProgress(null);
+
+    const result = await invoke<NetworkDiscoveryDevice[]>("network_discovery");
+
+    setDiscoveredDevices(result);
+  } catch (error) {
+    console.error("Failed to run network discovery:", error);
+    setError(String(error));
+  } finally {
+    setIsDiscovering(false);
+  }
+};
+
+const handlePortScan = async () => {
+  try {
+    setError("");
+    setIsPortScanning(true);
+    setPortScanResults([]);
+    setPortScanProgress(null);
+
+    const target = portScanTarget.trim();
+
+    if (!target) {
+      setError("Please enter a target.");
+      return;
+    }
+
+    let ports: number[];
+
+    if (portScanPreset === "CUSTOM") {
+      ports = customPorts
+        .split(",")
+        .map((port) => Number(port.trim()))
+        .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535);
+
+      if (ports.length === 0) {
+        setError("Please enter valid ports between 1 and 65535.");
+        return;
+      }
+    } else {
+      const preset = PORT_SCAN_PRESETS.find(
+        (item) => item.name === portScanPreset,
+      );
+
+      if (!preset) {
+        setError("Invalid port scan preset.");
+        return;
+      }
+
+      ports = preset.ports;
+    }
+
+    const uniquePorts = [...new Set(ports)];
+
+    const result = await invoke<PortScanResult[]>("port_scan", {
+      target,
+      ports: uniquePorts,
+    });
+
+    setPortScanResults(result);
+  } catch (error) {
+    console.error("Failed to run port scan:", error);
+    setError(String(error));
+  } finally {
+    setIsPortScanning(false);
+  }
+};
+
+async function handleRouteLookup() {
+  if (!routeLookupTarget.trim()) {
+    setRouteLookupError('Enter an IP address.');
+    return;
+  }
+
+  if (isLookingUpRoute) return;
+
+  setIsLookingUpRoute(true);
+  setRouteLookupError('');
+  setRouteLookupResult(null);
+
+  try {
+    const result = await invoke<RouteLookupResult>('route_lookup', {
+      target: routeLookupTarget.trim(),
+    });
+
+    setRouteLookupResult(result);
+  } catch (error) {
+    setRouteLookupError(String(error));
+  } finally {
+    setIsLookingUpRoute(false);
+  }
+}
+
+async function handleGlobalConnectivityTest() {
+  if (isCheckingConnectivity) {
+    return;
+  }
+
+  setIsCheckingConnectivity(true);
+  setConnectivityError('');
+  setGlobalConnectivity(null);
+
+  try {
+    const result = await invoke<GlobalConnectivityResult>(
+      'global_connectivity_test',
+    );
+
+    setGlobalConnectivity(result);
+  } catch (error) {
+    setConnectivityError(String(error));
+  } finally {
+    setIsCheckingConnectivity(false);
+  }
+}
 
 async function handlePing() {
   if (!pingTarget.trim()) {
@@ -522,7 +820,7 @@ async function handleHttpDiagnostic() {
     )}
 
     {pingResult && (
-      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="mt-5 grid grid-cols-6 gap-3">
         <div>
           <p className="text-[10px] text-[#9D8589]">PACKETS</p>
           <p className="mt-1 font-mono text-sm">
@@ -536,18 +834,38 @@ async function handleHttpDiagnostic() {
         </div>
 
         <div>
-          <p className="text-[10px] text-[#9D8589]">AVG</p>
+          <p className="text-[10px] text-[#9D8589]">MIN</p>
           <p className="mt-1 font-mono text-sm">
-            {pingResult.avg_ms !== null ? `${pingResult.avg_ms.toFixed(2)} ms` : "—"}
+            {pingResult.min_ms !== null
+              ? `${pingResult.min_ms.toFixed(2)} ms`
+              : '—'}
           </p>
         </div>
 
         <div>
-          <p className="text-[10px] text-[#9D8589]">MIN / MAX</p>
+          <p className="text-[10px] text-[#9D8589]">AVG</p>
           <p className="mt-1 font-mono text-sm">
-            {pingResult.min_ms !== null && pingResult.max_ms !== null
-              ? `${pingResult.min_ms.toFixed(2)} / ${pingResult.max_ms.toFixed(2)} ms`
-              : "—"}
+            {pingResult.avg_ms !== null
+              ? `${pingResult.avg_ms.toFixed(2)} ms`
+              : '—'}
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">JITTER</p>
+          <p className="mt-1 font-mono text-sm text-[#EEE5E6]">
+            {pingResult.jitter_ms !== null
+              ? `${pingResult.jitter_ms.toFixed(2)} ms`
+              : '—'}
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] text-[#9D8589]">MAX</p>
+          <p className="mt-1 font-mono text-sm">
+            {pingResult.max_ms !== null
+              ? `${pingResult.max_ms.toFixed(2)} ms`
+              : '—'}
           </p>
         </div>
       </div>
@@ -935,6 +1253,286 @@ async function handleHttpDiagnostic() {
 <section className="mb-6">
   <Card>
     <div className="mb-5">
+      <p className="text-xs tracking-[0.2em] text-[#9D8589]">
+        NETWORK
+      </p>
+
+      <h2 className="mt-2 text-lg font-semibold">Network Discovery</h2>
+
+      <p className="mt-1 text-sm text-[#9D8589]">
+        Discover active devices on the local IPv4 network.
+      </p>
+    </div>
+
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="text-sm text-[#9D8589]">
+        {discoveredDevices.length > 0
+          ? `${discoveredDevices.length} device${discoveredDevices.length > 1 ? "s" : ""} discovered`
+          : "No discovery results yet."}
+      </div>
+
+      <button
+        type="button"
+        onClick={handleNetworkDiscovery}
+        disabled={isDiscovering}
+        className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isDiscovering ? "SCANNING..." : "SCAN NETWORK"}
+      </button>
+
+      {isDiscovering && discoveryProgress && (
+        <div className="mt-5">
+          <div className="mb-2 flex items-center justify-between text-xs font-mono text-[#9D8589]">
+            <span>
+              Scanning {discoveryProgress.scanned} / {discoveryProgress.total}
+            </span>
+
+            <span className="ml-4">
+              {discoveryProgress.discovered} discovered
+            </span>
+          </div>
+
+          <div className="h-2 overflow-hidden rounded-full bg-[#1D0D11]">
+            <div
+              className="h-full rounded-full bg-[#8F1826] transition-[width] duration-150"
+              style={{
+                width: `${
+                  discoveryProgress.total > 0
+                    ? Math.min(
+                        100,
+                        (discoveryProgress.scanned / discoveryProgress.total) * 100,
+                      )
+                    : 0
+                }%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+    </div>
+
+    {discoveredDevices.length > 0 && (
+      <div className="mt-5 space-y-2">
+        {discoveredDevices.map((device) => (
+          <div
+            key={device.ip_address}
+            className="rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+          >
+            <div className="grid gap-3 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_auto] lg:items-center">
+              <div className="min-w-0">
+                <p className="font-mono text-sm text-[#EEE5E6]">
+                  {device.ip_address}
+                </p>
+
+                <p className="mt-1 truncate text-xs text-[#9D8589]">
+                  {device.hostname ?? "Hostname unavailable"}
+                </p>
+
+                <p className="mt-1 truncate text-xs text-[#6F5B5F]">
+                  {device.vendor ?? "Vendor unavailable"}
+                </p>
+
+              </div>
+
+              <div className="min-w-0">
+                <p className="font-mono text-xs text-[#9D8589]">
+                  {device.mac_address ?? "MAC unavailable"}
+                </p>
+
+                <p className="mt-1 text-xs text-[#6F5B5F]">
+                  {device.interface_name}
+                </p>
+              </div>
+
+              <div className="text-left lg:text-right">
+                <p className="font-mono text-xs text-[#8DBB9D]">
+                  {device.latency_ms !== null
+                    ? `${device.latency_ms.toFixed(2)} ms`
+                    : "—"}
+                </p>
+
+                <p className="mt-1 text-xs text-[#9D8589]">
+                  {device.state}
+                </p>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
+  </Card>
+</section>
+
+<section className="mb-6">
+  <Card>
+    <div className="mb-5">
+      <p className="text-xs tracking-[0.2em] text-[#9D8589]">
+        NETWORK
+      </p>
+
+      <h2 className="mt-2 text-lg font-semibold">Port Scanner</h2>
+
+      <p className="mt-1 text-sm text-[#9D8589]">
+        Scan common TCP ports on a target host.
+      </p>
+    </div>
+
+    <div className="mb-4">
+      <label
+        htmlFor="port-scan-preset"
+        className="mb-2 block text-xs tracking-[0.15em] text-[#9D8589]"
+      >
+        PRESET
+      </label>
+
+      <select
+        id="port-scan-preset"
+        value={portScanPreset}
+        onChange={(event) => setPortScanPreset(event.target.value)}
+        disabled={isPortScanning}
+        className="w-full appearance-none rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 text-sm text-[#EEE5E6] outline-none focus:border-[#8F1826] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {PORT_SCAN_PRESETS.map((preset) => (
+          <option
+            key={preset.name}
+            value={preset.name}
+            className="bg-[#1D0D11] text-[#EEE5E6]"
+          >
+            {preset.name}
+          </option>
+        ))}
+
+        <option
+          value="CUSTOM"
+          className="bg-[#1D0D11] text-[#EEE5E6]"
+        >
+          CUSTOM
+        </option>
+      </select>
+    </div>
+
+    {portScanPreset === "CUSTOM" && (
+      <div className="mb-4">
+        <label
+          htmlFor="custom-ports"
+          className="mb-2 block text-xs tracking-[0.15em] text-[#9D8589]"
+        >
+          CUSTOM PORTS
+        </label>
+
+        <input
+          id="custom-ports"
+          type="text"
+          value={customPorts}
+          onChange={(event) => setCustomPorts(event.target.value)}
+          placeholder="22,80,443,3000,8080"
+          disabled={isPortScanning}
+          className="w-full rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826] disabled:cursor-not-allowed disabled:opacity-50"
+        />
+
+        <p className="mt-2 text-xs text-[#6F5B5F]">
+          Enter ports separated by commas. Valid range: 1–65535.
+        </p>
+      </div>
+    )}
+
+    <div className="flex flex-col gap-3 sm:flex-row">
+      <input
+        type="text"
+        value={portScanTarget}
+        onChange={(event) => setPortScanTarget(event.target.value)}
+        placeholder="192.168.1.42 or hostname"
+        disabled={isPortScanning}
+        className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
+      />
+
+      <button
+        type="button"
+        onClick={handlePortScan}
+        disabled={isPortScanning}
+        className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-6 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {isPortScanning ? "SCANNING..." : "SCAN PORTS"}
+      </button>
+    </div>
+
+    {isPortScanning && portScanProgress && (
+      <div className="mt-5">
+        <div className="mb-2 flex items-center justify-between gap-4 text-xs font-mono text-[#9D8589]">
+          <span>
+            Scanning {portScanProgress.scanned} / {portScanProgress.total}
+          </span>
+
+          <span className="shrink-0">
+            {portScanProgress.open_ports} open ports
+          </span>
+        </div>
+
+        <div className="h-2 overflow-hidden rounded-full bg-[#1D0D11]">
+          <div
+            className="h-full rounded-full bg-[#8F1826] transition-[width] duration-150"
+            style={{
+              width: `${
+                portScanProgress.total > 0
+                  ? Math.min(
+                      100,
+                      (portScanProgress.scanned / portScanProgress.total) * 100,
+                    )
+                  : 0
+              }%`,
+            }}
+          />
+        </div>
+      </div>
+    )}
+
+    {portScanResults.length > 0 && (
+      <div className="mt-5 space-y-2">
+        {portScanResults.map((result) => (
+          <div
+            key={result.port}
+            className="flex items-center justify-between rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3"
+          >
+            <div className="flex items-center gap-4">
+              <span className="font-mono text-sm text-[#EEE5E6]">
+                {result.port}
+              </span>
+
+              <span
+                className={`text-xs ${
+                  result.open ? "text-[#8DBB9D]" : "text-[#9D8589]"
+                }`}
+              >
+                {result.open ? "OPEN" : "CLOSED"}
+              </span>
+
+              {result.open && result.service && (
+                <span className="text-xs text-[#EEE5E6]">
+                  {result.service}
+                </span>
+              )}
+            </div>
+
+            <span
+              className={`font-mono text-xs ${
+                result.open ? "text-[#8DBB9D]" : "text-[#6F5B5F]"
+              }`}
+            >
+              {result.connect_time_ms !== null
+                ? `${result.connect_time_ms.toFixed(2)} ms`
+                : "—"}
+            </span>
+          </div>
+        ))}
+      </div>
+    )}
+  </Card>
+</section>
+
+<section className="mb-6">
+  <Card>
+    <div className="mb-5">
       <p className="text-xs tracking-[0.2em] text-[#9D8589]">DNS</p>
 
       <h2 className="mt-2 text-lg font-semibold">DNS Lookup</h2>
@@ -1152,7 +1750,6 @@ async function handleHttpDiagnostic() {
               </p>
             )}
           </div>
-
 
       <div className="flex items-center gap-3">
         <div className="font-mono text-sm">
@@ -1450,8 +2047,218 @@ async function handleHttpDiagnostic() {
       </div>
 
       <section className="grid grid-cols-2 gap-4">
-        <Card>
+        <div className="col-span-2">
+          <Card>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs text-[#9D8589]">GLOBAL CONNECTIVITY</p>
+                <p className="mt-1 text-xs text-[#6F5A5E]">
+                  Gateway · DNS · Internet · HTTPS
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleGlobalConnectivityTest}
+                disabled={isCheckingConnectivity}
+                className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-4 py-2 text-xs font-medium tracking-wide transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isCheckingConnectivity ? 'TESTING...' : 'RUN TEST'}
+              </button>
+            </div>
+
+  {connectivityError && (
+    <div className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3">
+      <p className="text-xs text-[#D45767]">{connectivityError}</p>
+    </div>
+  )}
+
+  {globalConnectivity && (
+    <div className="mt-5 grid grid-cols-2 gap-3">
+      {globalConnectivity.checks.map((check) => (
+        <div
+          key={check.name}
+          className="rounded-md border border-[#3B171D] bg-[#170A0D] p-4"
+        >
           <div className="flex items-center justify-between">
+            <span className="text-xs font-medium tracking-wide text-[#EEE5E6]">
+              {check.name}
+            </span>
+
+            <span
+              className={`text-[10px] font-medium uppercase tracking-wide ${
+                check.status === 'online'
+                  ? 'text-[#8DBB9D]'
+                  : check.status === 'degraded'
+                    ? 'text-[#C89A65]'
+                    : 'text-[#D45767]'
+              }`}
+            >
+              {check.status}
+            </span>
+          </div>
+
+          <div className="mt-4 space-y-2">
+            {check.name === 'Internet' && check.detail ? (
+              check.detail.split(' · ').map((endpoint) => {
+                const [target, status] = endpoint.split(': ');
+
+                return (
+                  <div
+                    key={target}
+                    className="flex items-center justify-between gap-4 font-mono text-xs"
+                  >
+                    <span className="text-[#9D8589]">{target}</span>
+
+                    <span
+                      className={
+                        status === 'reachable'
+                          ? 'text-[#8DBB9D]'
+                          : 'text-[#D45767]'
+                      }
+                    >
+                      → {status?.toUpperCase() ?? 'UNKNOWN'}
+                    </span>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3 font-mono text-xs">
+                <span className="min-w-0 break-words text-[#9D8589]">
+                  {check.detail ?? '—'}
+                </span>
+
+                <span
+                  className={`whitespace-nowrap ${
+                    check.status === 'online'
+                      ? 'text-[#8DBB9D]'
+                      : check.status === 'degraded'
+                        ? 'text-[#C89A65]'
+                        : 'text-[#D45767]'
+                  }`}
+                >
+                  → {check.status === 'online' ? 'REACHABLE' : 'UNREACHABLE'}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {check.latency_ms !== null && (
+            <div className="mt-3 flex justify-end border-t border-[#3B171D] pt-2">
+              <span className="font-mono text-xs text-[#EEE5E6]">
+                {check.latency_ms.toFixed(1)} ms
+              </span>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  {globalConnectivity && (
+    <div className="mt-4 flex items-center justify-between border-t border-[#3B171D] pt-4">
+      <span className="text-[10px] tracking-[0.15em] text-[#9D8589]">
+        OVERALL STATUS
+      </span>
+
+      <span
+        className={`font-mono text-xs uppercase ${
+          globalConnectivity.status === 'online'
+            ? 'text-[#8DBB9D]'
+            : globalConnectivity.status === 'degraded'
+              ? 'text-[#C89A65]'
+              : 'text-[#D45767]'
+        }`}
+      >
+        {globalConnectivity.status}
+      </span>
+    </div>
+  )}
+    </Card>
+      </div>
+
+      <Card>
+  <div className="flex items-center justify-between">
+    <div>
+      <p className="text-xs text-[#9D8589]">ROUTE LOOKUP</p>
+      <p className="mt-1 text-xs text-[#6F5A5E]">
+        Find the route used to reach an IP address
+      </p>
+    </div>
+  </div>
+
+  <div className="mt-4 flex gap-3">
+    <input
+      type="text"
+      value={routeLookupTarget}
+      onChange={(event) => setRouteLookupTarget(event.target.value)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          void handleRouteLookup();
+        }
+      }}
+      placeholder="8.8.8.8"
+      className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#100709] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5A5E] focus:border-[#8F1826]"
+    />
+
+    <button
+      type="button"
+      onClick={() => void handleRouteLookup()}
+      disabled={isLookingUpRoute}
+      className="rounded-md border border-[#542028] bg-gradient-to-r from-[#6F111C] to-[#8F1826] px-5 py-3 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {isLookingUpRoute ? 'LOOKING UP...' : 'LOOK UP'}
+    </button>
+  </div>
+
+  {routeLookupError && (
+    <div className="mt-4 rounded-md border border-[#542028] bg-[#1D0D11] px-4 py-3 text-xs text-[#D45767]">
+      {routeLookupError}
+    </div>
+  )}
+
+  {routeLookupResult && (
+    <div className="mt-4 grid grid-cols-2 gap-3">
+      <div className="rounded-md border border-[#3B171D] bg-[#170A0D] px-4 py-3">
+        <p className="text-[10px] text-[#6F5A5E]">TARGET</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#EEE5E6]">
+          {routeLookupResult.target}
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#170A0D] px-4 py-3">
+        <p className="text-[10px] text-[#6F5A5E]">ROUTE</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#EEE5E6]">
+          {routeLookupResult.destination}
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#170A0D] px-4 py-3">
+        <p className="text-[10px] text-[#6F5A5E]">GATEWAY</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#EEE5E6]">
+          {routeLookupResult.gateway ?? 'DIRECT'}
+        </p>
+      </div>
+
+      <div className="rounded-md border border-[#3B171D] bg-[#170A0D] px-4 py-3">
+        <p className="text-[10px] text-[#6F5A5E]">INTERFACE</p>
+        <p className="mt-1 break-all font-mono text-xs text-[#EEE5E6]">
+          {routeLookupResult.interface_name ?? '—'}
+        </p>
+      </div>
+
+      <div className="col-span-2 rounded-md border border-[#3B171D] bg-[#170A0D] px-4 py-3">
+        <p className="text-[10px] text-[#6F5A5E]">METRIC</p>
+        <p className="mt-1 font-mono text-xs text-[#EEE5E6]">
+          {routeLookupResult.metric ?? '—'}
+        </p>
+      </div>
+    </div>
+  )}
+</Card>
+
+      <Card>
+        <div className="flex items-center justify-between">
             <p className="text-xs text-[#9D8589]">NETWORK INTERFACES</p>
 
             <span className="font-mono text-xs text-[#9D8589]">
@@ -1501,23 +2308,33 @@ async function handleHttpDiagnostic() {
                     </div>
                   ))}
 
-                  {networkInterface.ipv6_addresses.map((addressInfo) => {
-                    const label = addressInfo.is_link_local
-                      ? "IPv6 LL"
-                      : addressInfo.is_temporary
-                        ? "IPv6 TEMP"
-                        : "IPv6";
+                  {[...networkInterface.ipv6_addresses]
+                    .sort((a, b) => {
+                      const order = (address: typeof a) => {
+                        if (address.is_link_local) return 2;
+                        if (address.is_temporary) return 1;
+                        return 0;
+                      };
 
-                    return (
-                      <div
-                        key={`ipv6-${addressInfo.address}`}
-                        className="grid grid-cols-[5rem_minmax(0,1fr)] items-start gap-3"
-                      >
-                        <span className="whitespace-nowrap text-[#9D8589]">{label}</span>
-                        <span className="break-all">{addressInfo.address}</span>
-                      </div>
-                    );
-                  })}
+                      return order(a) - order(b);
+                    })
+                    .map((addressInfo) => {
+                      const label = addressInfo.is_link_local
+                        ? "IPv6 LL"
+                        : addressInfo.is_temporary
+                          ? "IPv6 TEMP"
+                          : "IPv6";
+
+                      return (
+                        <div
+                          key={`ipv6-${addressInfo.address}`}
+                          className="grid grid-cols-[5rem_minmax(0,1fr)] items-start gap-3"
+                        >
+                          <span className="whitespace-nowrap text-[#9D8589]">{label}</span>
+                          <span className="break-all">{addressInfo.address}</span>
+                        </div>
+                      );
+                    })}
 
                   {networkInterface.wifi_rx_bitrate_mbps !== null && (
                     <div className="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-3">
@@ -1561,7 +2378,8 @@ async function handleHttpDiagnostic() {
                 Loading interfaces...
               </p>
             )}
-          </div>
+
+            </div>
         </Card>
 
         <Card>
