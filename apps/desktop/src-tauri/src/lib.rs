@@ -15,7 +15,6 @@ use russh::client;
 use std::io::Cursor;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
 use tokio::io::AsyncReadExt;
 const OUI_DATABASE: &str =
     include_str!("../../../../packages/network-core/data/oui.csv");
@@ -288,6 +287,20 @@ fn unregister_sftp_transfer(
     if let Ok(mut active) = registry.active.lock() {
         active.remove(transfer_id);
     };
+}
+
+struct SftpTransferGuard {
+    app_handle: tauri::AppHandle,
+    transfer_id: String,
+}
+
+impl Drop for SftpTransferGuard {
+    fn drop(&mut self) {
+        unregister_sftp_transfer(
+            &self.app_handle,
+            &self.transfer_id,
+        );
+    }
 }
 
 async fn inspect_tls(host: &str, port: u16) -> Result<TlsInfo, String> {
@@ -3227,6 +3240,11 @@ async fn sftp_download_multiple(
     active.insert(transfer_id.clone(), Arc::clone(&cancel_flag));
 }
 
+    let _transfer_guard = SftpTransferGuard {
+        app_handle: app_handle.clone(),
+        transfer_id: transfer_id.clone(),
+    };
+
     let connection = init_database(&app_handle)?;
 
     let server = connection
@@ -3375,6 +3393,9 @@ async fn sftp_download_multiple(
 
     let transferred_bytes = Arc::new(AtomicU64::new(0));
 
+    let created_paths: Arc<Mutex<Vec<PathBuf>>> =
+    Arc::new(Mutex::new(Vec::new()));
+
     // Download a file or folder recursively.
     fn download_entry<'a>(
         sftp: &'a russh_sftp::client::SftpSession,
@@ -3385,6 +3406,7 @@ async fn sftp_download_multiple(
         transferred_bytes: Arc<AtomicU64>,
         total_bytes: u64,
         cancel_flag: Arc<AtomicBool>,
+        created_paths: Arc<Mutex<Vec<PathBuf>>>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
     > {
@@ -3405,14 +3427,32 @@ async fn sftp_download_multiple(
                 })?;
 
             if metadata.is_dir() {
-                tokio::fs::create_dir_all(&local_path)
+                let directory_exists = tokio::fs::try_exists(&local_path)
                     .await
                     .map_err(|error| {
                         format!(
-                            "Failed to create directory '{}': {error}",
+                            "Failed to check directory '{}': {error}",
                             local_path.display()
                         )
                     })?;
+
+                if !directory_exists {
+                    tokio::fs::create_dir(&local_path)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "Failed to create directory '{}': {error}",
+                                local_path.display()
+                            )
+                        })?;
+
+                    created_paths
+                        .lock()
+                        .map_err(|_| {
+                            "Impossible d'accéder aux chemins créés.".to_string()
+                        })?
+                        .push(local_path.clone());
+                }
 
                 let entries = sftp
                     .read_dir(remote_path.clone())
@@ -3447,6 +3487,7 @@ async fn sftp_download_multiple(
                         Arc::clone(&transferred_bytes),
                         total_bytes,
                         Arc::clone(&cancel_flag),
+                        Arc::clone(&created_paths),
                     )
                     .await?;
                 }
@@ -3500,6 +3541,13 @@ async fn sftp_download_multiple(
                         )
                     })?;
 
+                created_paths
+                    .lock()
+                    .map_err(|_| {
+                        "Impossible d'accéder aux chemins créés.".to_string()
+                    })?
+                    .push(local_path.clone());
+
                 let file_name = local_path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -3508,69 +3556,80 @@ async fn sftp_download_multiple(
 
                 let mut buffer = vec![0u8; 64 * 1024];
 
-                loop {
+                let transfer_result: Result<(), String> = async {
+                    loop {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            return Err("Transfert annulé.".to_string());
+                        }
 
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        drop(local_file);
+                        let bytes_read = remote_file
+                            .read(&mut buffer)
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "Failed to read remote file '{remote_path}': {error}"
+                                )
+                            })?;
 
-                        let _ = tokio::fs::remove_file(&local_path).await;
+                        if bytes_read == 0 {
+                            break;
+                        }
 
-                        return Err("Transfert annulé.".to_string());
-                    }
+                        local_file
+                            .write_all(&buffer[..bytes_read])
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "Failed to write local file '{}': {error}",
+                                    local_path.display()
+                                )
+                            })?;
 
-                    let bytes_read = remote_file
-                        .read(&mut buffer)
-                        .await
-                        .map_err(|error| {
-                            format!(
-                                "Failed to read remote file '{remote_path}': {error}"
-                            )
-                        })?;
+                        let current_bytes = transferred_bytes
+                            .fetch_add(bytes_read as u64, Ordering::Relaxed)
+                            + bytes_read as u64;
 
-                    if bytes_read == 0 {
-                        break;
+                        let progress = SftpTransferProgress {
+                            transfer_id: transfer_id.clone(),
+                            transferred_bytes: current_bytes,
+                            total_bytes,
+                            file_name: file_name.clone(),
+                            completed: false,
+                        };
+
+                        app_handle
+                            .emit("sftp-transfer-progress", progress)
+                            .map_err(|error| {
+                                format!("Failed to emit transfer progress: {error}")
+                            })?;
                     }
 
                     local_file
-                        .write_all(&buffer[..bytes_read])
+                        .flush()
                         .await
                         .map_err(|error| {
                             format!(
-                                "Failed to write local file '{}': {error}",
+                                "Failed to finalize local file '{}': {error}",
                                 local_path.display()
                             )
                         })?;
 
-                    let current_bytes = transferred_bytes
-                        .fetch_add(bytes_read as u64, Ordering::Relaxed)
-                        + bytes_read as u64;
-
-                    let progress = SftpTransferProgress {
-                        transfer_id: transfer_id.clone(),
-                        transferred_bytes: current_bytes,
-                        total_bytes,
-                        file_name: file_name.clone(),
-                        completed: false,
-                    };
-
-                    app_handle
-                        .emit("sftp-transfer-progress", progress)
-                        .map_err(|error| {
-                            format!(
-                                "Failed to emit transfer progress: {error}"
-                            )
-                        })?;
+                    Ok(())
                 }
+                .await;
 
-                local_file
-                    .flush()
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "Failed to finalize local file '{}': {error}",
-                            local_path.display()
-                        )
-                    })?;
+                drop(local_file);
+
+                if let Err(error) = transfer_result {
+                    match tokio::fs::remove_file(&local_path).await {
+                        Ok(()) => {
+                        }
+                        Err(remove_error) => {
+                        }
+                    }
+
+                    return Err(error);
+                }
 
                 Ok(())
             } else {
@@ -3581,20 +3640,54 @@ async fn sftp_download_multiple(
         })
     }
 
-    // Télécharger chaque entrée sélectionnée.
+    // Remove files and empty directories created by a failed or cancelled transfer.
+    async fn cleanup_created_paths(created_paths: &Arc<Mutex<Vec<PathBuf>>>) {
+        let paths = match created_paths.lock() {
+            Ok(paths) => paths.clone(),
+            Err(error) => {
+                return;
+            }
+        };
+
+        // Remove children before their parent directories.
+        for path in paths.iter().rev() {
+            match tokio::fs::metadata(path).await {
+                Ok(metadata) if metadata.is_dir() => {
+                    if let Err(_error) = tokio::fs::remove_dir(path).await {
+                    }
+                }
+                Ok(_) => {
+                    if let Err(_error) = tokio::fs::remove_file(path).await {
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                }
+            }
+        }
+    }
+
+    // Download each selected entry.
     for resolved_path in resolved_paths {
-        let file_name = Path::new(&resolved_path)
+        let file_name = match Path::new(&resolved_path)
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                format!(
+        {
+            Some(name) => name,
+            None => {
+                let error = format!(
                     "Impossible de déterminer le nom de '{resolved_path}'"
-                )
-            })?;
+                );
+
+                cleanup_created_paths(&created_paths).await;
+                return Err(error);
+            }
+        };
 
         let destination = local_root.join(file_name);
 
-        download_entry(
+        if let Err(error) = download_entry(
             &sftp,
             app_handle.clone(),
             transfer_id.clone(),
@@ -3603,8 +3696,13 @@ async fn sftp_download_multiple(
             Arc::clone(&transferred_bytes),
             total_bytes,
             Arc::clone(&cancel_flag),
+            Arc::clone(&created_paths),
         )
-        .await?;
+        .await
+        {
+            cleanup_created_paths(&created_paths).await;
+            return Err(error);
+        }
     }
 
     // Report the end of the transfer.

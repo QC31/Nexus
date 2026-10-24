@@ -137,7 +137,7 @@ export default function SshManagerPage() {
     fileName: string;
     completed: boolean;
   } | null>(null);
-
+  const [sftpTransferCancelled, setSftpTransferCancelled] = useState(false);
   const cancelSftpTransfer = async () => {
   if (!sftpTransferProgress || sftpTransferProgress.completed) {
     return;
@@ -971,6 +971,8 @@ const downloadSelectedSftpEntries = async () => {
 
   try {
     setError('');
+    setSftpTransferCancelled(false);
+    setSftpTransferProgress(null);
 
     // Choisir le dossier local de destination.
     const localDirectory = await open({
@@ -1005,7 +1007,13 @@ const downloadSelectedSftpEntries = async () => {
     console.log('[SFTP] Téléchargement multiple terminé');
   } catch (error) {
     console.error('[SFTP] Erreur de téléchargement multiple :', error);
-    setError(`Échec du téléchargement multiple : ${String(error)}`);
+
+    if (String(error).includes('Transfert annulé')) {
+      setSftpTransferCancelled(true);
+      setError('');
+    } else {
+      setError(`Échec du téléchargement multiple : ${String(error)}`);
+    }
   }
 };
 
@@ -1970,9 +1978,11 @@ const sftpPathSegments =
                             <div className="mb-2 flex items-center justify-between gap-3">
                               <div className="min-w-0">
                                 <p className="text-sm font-medium text-[#EEE5E6]">
-                                  {sftpTransferProgress.completed
-                                    ? 'Download is complete'
-                                    : 'Download in progress'}
+                                  {sftpTransferCancelled
+                                    ? 'Download cancelled'
+                                    : sftpTransferProgress.completed
+                                      ? 'Download is complete'
+                                      : 'Download in progress'}
                                 </p>
 
                                 {sftpTransferProgress.fileName && (
@@ -1998,7 +2008,7 @@ const sftpPathSegments =
                                       : 'Calcul…'}
                                 </span>
 
-                                {!sftpTransferProgress.completed && (
+                                {!sftpTransferProgress.completed && !sftpTransferCancelled && (
                                   <button
                                     type="button"
                                     onClick={() => void cancelSftpTransfer()}
