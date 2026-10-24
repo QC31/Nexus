@@ -130,6 +130,28 @@ export default function SshManagerPage() {
   const [isLoadingSftp, setIsLoadingSftp] = useState(false);
   const [sftpEntries, setSftpEntries] = useState<SftpDirectoryEntry[]>([]);
   const [selectedSftpEntries, setSelectedSftpEntries] = useState<string[]>([]);
+  const [sftpTransferProgress, setSftpTransferProgress] = useState<{
+    transferId: string;
+    transferredBytes: number;
+    totalBytes: number;
+    fileName: string;
+    completed: boolean;
+  } | null>(null);
+
+  const cancelSftpTransfer = async () => {
+  if (!sftpTransferProgress || sftpTransferProgress.completed) {
+    return;
+  }
+
+  try {
+    await invoke('cancel_sftp_transfer', {
+      transferId: sftpTransferProgress.transferId,
+    });
+  } catch (error) {
+    console.error('Failed to cancel SFTP transfer:', error);
+  }
+};
+
   const [sftpCurrentPath, setSftpCurrentPath] = useState('/');
   const [activeSessionView, setActiveSessionView] = useState<
     'terminal' | 'sftp'
@@ -147,6 +169,46 @@ export default function SshManagerPage() {
       : [...current, entryName]
   );
 };
+
+useEffect(() => {
+  let unlisten: (() => void) | undefined;
+  let active = true;
+
+  const setupListener = async () => {
+    const stopListening = await listen<{
+      transfer_id: string;
+      transferred_bytes: number;
+      total_bytes: number;
+      file_name: string;
+      completed: boolean;
+    }>('sftp-transfer-progress', (event) => {
+      if (!active) return;
+
+      const progress = event.payload;
+
+      setSftpTransferProgress({
+        transferId: progress.transfer_id,
+        transferredBytes: progress.transferred_bytes,
+        totalBytes: progress.total_bytes,
+        fileName: progress.file_name,
+        completed: progress.completed,
+      });
+    });
+
+    if (active) {
+      unlisten = stopListening;
+    } else {
+      stopListening();
+    }
+  };
+
+  void setupListener();
+
+  return () => {
+    active = false;
+    unlisten?.();
+  };
+}, []);
 
 const toggleSelectAllSftpEntries = () => {
   setSelectedSftpEntries((current) => {
@@ -1902,6 +1964,96 @@ const sftpPathSegments =
                             </button>
                           </div>
                         </div>
+
+                        {sftpTransferProgress && (
+                          <div className="border-b border-[#2A1115] bg-[#160B0E] px-4 py-3">
+                            <div className="mb-2 flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="text-sm font-medium text-[#EEE5E6]">
+                                  {sftpTransferProgress.completed
+                                    ? 'Download is complete'
+                                    : 'Download in progress'}
+                                </p>
+
+                                {sftpTransferProgress.fileName && (
+                                  <p className="truncate text-xs text-[#C8B8BB]">
+                                    {sftpTransferProgress.fileName}
+                                  </p>
+                                )}
+                              </div>
+
+                              <div className="flex shrink-0 items-center gap-3">
+                                <span className="text-sm font-semibold text-[#EEE5E6]">
+                                  {sftpTransferProgress.totalBytes > 0
+                                    ? `${Math.min(
+                                        100,
+                                        Math.round(
+                                          (sftpTransferProgress.transferredBytes /
+                                            sftpTransferProgress.totalBytes) *
+                                            100
+                                        )
+                                      )}%`
+                                    : sftpTransferProgress.completed
+                                      ? '100%'
+                                      : 'Calcul…'}
+                                </span>
+
+                                {!sftpTransferProgress.completed && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void cancelSftpTransfer()}
+                                    className="rounded-md border border-[#71303B] px-3 py-1 text-xs font-medium text-[#EEE5E6] transition-colors hover:bg-[#3B171D] focus:outline-none focus:ring-2 focus:ring-[#A34A5A]"
+                                  >
+                                    Cancel
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            <div
+                              className="h-2 overflow-hidden rounded-full bg-[#2A1115]"
+                              role="progressbar"
+                              aria-label="Progression du téléchargement"
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                              aria-valuenow={
+                                sftpTransferProgress.totalBytes > 0
+                                  ? Math.min(
+                                      100,
+                                      Math.round(
+                                        (sftpTransferProgress.transferredBytes /
+                                          sftpTransferProgress.totalBytes) *
+                                          100
+                                      )
+                                    )
+                                  : 0
+                              }
+                            >
+                              <div
+                                className="h-full rounded-full bg-gradient-to-r from-[#71303B] to-[#A34A5A] transition-all duration-150"
+                                style={{
+                                  width: `${
+                                    sftpTransferProgress.totalBytes > 0
+                                      ? Math.min(
+                                          100,
+                                          (sftpTransferProgress.transferredBytes /
+                                            sftpTransferProgress.totalBytes) *
+                                            100
+                                        )
+                                      : sftpTransferProgress.completed
+                                        ? 100
+                                        : 0
+                                  }%`,
+                                }}
+                              />
+                            </div>
+
+                            <p className="mt-1 text-xs text-[#C8B8BB]">
+                              {(sftpTransferProgress.transferredBytes / (1024 * 1024)).toFixed(2)} Mo
+                              {' / '}
+                              {(sftpTransferProgress.totalBytes / (1024 * 1024)).toFixed(2)} Mo
+                            </p>
+                          </div>
+                        )}
 
                         <div className="divide-y divide-[#2A1115]">
                           {sftpEntries.map((entry) => (

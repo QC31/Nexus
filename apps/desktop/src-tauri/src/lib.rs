@@ -238,6 +238,58 @@ struct TracerouteHop {
     latency_ms: Option<f64>,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct SftpTransferProgress {
+    transfer_id: String,
+    transferred_bytes: u64,
+    total_bytes: u64,
+    file_name: String,
+    completed: bool,
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Default)]
+struct SftpTransferRegistry {
+    active: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+#[tauri::command]
+fn cancel_sftp_transfer(
+    app_handle: tauri::AppHandle,
+    transfer_id: String,
+) -> Result<(), String> {
+    use tauri::Manager;
+
+    let registry = app_handle.state::<SftpTransferRegistry>();
+
+    let active = registry
+        .active
+        .lock()
+        .map_err(|_| "Impossible d'accéder au registre des transferts.".to_string())?;
+
+    match active.get(&transfer_id) {
+        Some(cancel_flag) => {
+            cancel_flag.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err("Ce transfert n'est plus actif.".to_string()),
+    }
+}
+
+fn unregister_sftp_transfer(
+    app_handle: &tauri::AppHandle,
+    transfer_id: &str,
+) {
+    use tauri::Manager;
+
+    let registry = app_handle.state::<SftpTransferRegistry>();
+
+    if let Ok(mut active) = registry.active.lock() {
+        active.remove(transfer_id);
+    };
+}
+
 async fn inspect_tls(host: &str, port: u16) -> Result<TlsInfo, String> {
     use rustls::pki_types::ServerName;
     use rustls::ClientConfig;
@@ -2909,25 +2961,16 @@ async fn sftp_upload_file(
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // 1. Vérifier que le fichier local existe et le lire.
+    // Open the local file without loading it fully into memory.
     let mut local_file = tokio::fs::File::open(&local_path)
         .await
         .map_err(|error| {
             format!("Failed to open local file '{local_path}': {error}")
         })?;
 
-    let mut file_contents = Vec::new();
-
-    local_file
-        .read_to_end(&mut file_contents)
-        .await
-        .map_err(|error| {
-            format!("Failed to read local file '{local_path}': {error}")
-        })?;
-
-    // 2. Récupérer la configuration du serveur SSH.
+    // 2. Retrieve the SSH server configuration.
     let connection = init_database(&app_handle)?;
 
     let server = connection
@@ -2969,14 +3012,14 @@ async fn sftp_upload_file(
 
     let config = ssh_connection_config(&server);
 
-    // 3. Récupérer le mot de passe si nécessaire.
+    // 3. Retrieve the password if necessary.
     let password = if server.authentication_method == "password" {
         get_ssh_password(server.id.clone())?
     } else {
         None
     };
 
-    // 4. Établir la session SFTP.
+    // 4. Establish the SFTP session.
     let sftp = connect_sftp_server(
         &config,
         server.host_key_fingerprint.clone(),
@@ -2984,7 +3027,7 @@ async fn sftp_upload_file(
     )
     .await?;
 
-    // 5. Vérifier le chemin distant et envoyer le fichier.
+    // 5. Check the remote path and send the file.
     let resolved_path = sftp
         .canonicalize(remote_path.clone())
         .await
@@ -2999,12 +3042,27 @@ async fn sftp_upload_file(
             format!("Failed to create remote file '{resolved_path}': {error}")
         })?;
 
-    remote_file
-        .write_all(&file_contents)
-        .await
-        .map_err(|error| {
-            format!("Failed to write remote file '{resolved_path}': {error}")
-        })?;
+    let mut buffer = vec![0u8; 64 * 1024];
+
+    loop {
+        let bytes_read = local_file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| {
+                format!("Failed to read local file '{local_path}': {error}")
+            })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        remote_file
+            .write_all(&buffer[..bytes_read])
+            .await
+            .map_err(|error| {
+                format!("Failed to write remote file '{resolved_path}': {error}")
+            })?;
+    }
 
     remote_file
         .shutdown()
@@ -3025,7 +3083,7 @@ async fn sftp_download_file(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    // 1. Récupérer la configuration du serveur SSH.
+    // 1. Retrieve the SSH server configuration.
     let connection = init_database(&app_handle)?;
 
     let server = connection
@@ -3067,14 +3125,14 @@ async fn sftp_download_file(
 
     let config = ssh_connection_config(&server);
 
-    // 2. Récupérer le mot de passe si nécessaire.
+    // 2. Retrieve the password if necessary.
     let password = if server.authentication_method == "password" {
         get_ssh_password(server.id.clone())?
     } else {
         None
     };
 
-    // 3. Établir la session SFTP.
+    // 3. Establish the SFTP session.
     let sftp = connect_sftp_server(
         &config,
         server.host_key_fingerprint.clone(),
@@ -3082,7 +3140,7 @@ async fn sftp_download_file(
     )
     .await?;
 
-    // 4. Ouvrir et lire le fichier distant.
+    // 4. Open and read the remote file.
     let resolved_path = sftp
         .canonicalize(remote_path.clone())
         .await
@@ -3097,28 +3155,33 @@ async fn sftp_download_file(
             format!("Failed to open remote file '{resolved_path}': {error}")
         })?;
 
-    let mut file_contents = Vec::new();
-
-    remote_file
-        .read_to_end(&mut file_contents)
-        .await
-        .map_err(|error| {
-            format!("Failed to read remote file '{resolved_path}': {error}")
-        })?;
-
-    // 5. Enregistrer le fichier sur le PC.
     let mut local_file = tokio::fs::File::create(&local_path)
         .await
         .map_err(|error| {
             format!("Failed to create local file '{local_path}': {error}")
         })?;
 
-    local_file
-        .write_all(&file_contents)
-        .await
-        .map_err(|error| {
-            format!("Failed to write local file '{local_path}': {error}")
-        })?;
+    let mut buffer = vec![0u8; 64 * 1024]; // 64 Ko Blocks.
+
+    loop {
+        let bytes_read = remote_file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| {
+                format!("Failed to read remote file '{resolved_path}': {error}")
+            })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        local_file
+            .write_all(&buffer[..bytes_read])
+            .await
+            .map_err(|error| {
+                format!("Failed to write local file '{local_path}': {error}")
+            })?;
+    }
 
     local_file
         .flush()
@@ -3137,11 +3200,32 @@ async fn sftp_download_multiple(
     remote_paths: Vec<String>,
     local_directory: String,
 ) -> Result<(), String> {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     if remote_paths.is_empty() {
         return Err("Aucun fichier ou dossier sélectionné.".to_string());
     }
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+{
+    use tauri::Manager;
+
+    let registry = app_handle.state::<SftpTransferRegistry>();
+
+    let mut active = registry
+        .active
+        .lock()
+        .map_err(|_| "Unable to access transfer log.".to_string())?;
+
+    active.insert(transfer_id.clone(), Arc::clone(&cancel_flag));
+}
 
     let connection = init_database(&app_handle)?;
 
@@ -3208,17 +3292,109 @@ async fn sftp_download_multiple(
             )
         })?;
 
-    // Télécharge récursivement une entrée SFTP.
-    fn download_entry<'a>(
+    // Calculate the total size of files recursively.
+    fn calculate_remote_size<'a>(
         sftp: &'a russh_sftp::client::SftpSession,
         remote_path: String,
-        local_path: PathBuf,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), String>> + Send + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<u64, String>> + Send + 'a>,
     > {
         Box::pin(async move {
+            let metadata = sftp
+                .metadata(remote_path.clone())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to read metadata for '{remote_path}': {error}"
+                    )
+                })?;
+
+            if metadata.is_dir() {
+                let entries = sftp
+                    .read_dir(remote_path.clone())
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Failed to read remote directory '{remote_path}': {error}"
+                        )
+                    })?;
+
+                let mut total_size = 0u64;
+
+                for entry in entries {
+                    let name = entry.file_name();
+
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+
+                    let child_path = format!(
+                        "{}/{}",
+                        remote_path.trim_end_matches('/'),
+                        name
+                    );
+
+                    total_size += calculate_remote_size(
+                        sftp,
+                        child_path,
+                    )
+                    .await?;
+                }
+
+                Ok(total_size)
+            } else if metadata.is_regular() {
+                Ok(metadata.size.unwrap_or(0))
+            } else {
+                Ok(0)
+            }
+        })
+    }
+
+    // Solve the paths and calculate the total size before transferring.
+    let mut resolved_paths = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for remote_path in remote_paths {
+        let resolved_path = sftp
+            .canonicalize(remote_path.clone())
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to resolve remote path '{remote_path}': {error}"
+                )
+            })?;
+
+        total_bytes += calculate_remote_size(
+            &sftp,
+            resolved_path.clone(),
+        )
+        .await?;
+
+        resolved_paths.push(resolved_path);
+    }
+
+    let transferred_bytes = Arc::new(AtomicU64::new(0));
+
+    // Download a file or folder recursively.
+    fn download_entry<'a>(
+        sftp: &'a russh_sftp::client::SftpSession,
+        app_handle: tauri::AppHandle,
+        transfer_id: String,
+        remote_path: String,
+        local_path: PathBuf,
+        transferred_bytes: Arc<AtomicU64>,
+        total_bytes: u64,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            // Check if the transfer was canceled
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err("Transfert annulé.".to_string());
+            }
+
+            // Read metadata from the remote file or folder.
             let metadata = sftp
                 .metadata(remote_path.clone())
                 .await
@@ -3264,8 +3440,13 @@ async fn sftp_download_multiple(
 
                     download_entry(
                         sftp,
+                        app_handle.clone(),
+                        transfer_id.clone(),
                         child_remote,
                         child_local,
+                        Arc::clone(&transferred_bytes),
+                        total_bytes,
+                        Arc::clone(&cancel_flag),
                     )
                     .await?;
                 }
@@ -3307,17 +3488,6 @@ async fn sftp_download_multiple(
                         )
                     })?;
 
-                let mut contents = Vec::new();
-
-                remote_file
-                    .read_to_end(&mut contents)
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "Failed to read remote file '{remote_path}': {error}"
-                        )
-                    })?;
-
                 let mut local_file = tokio::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -3330,15 +3500,67 @@ async fn sftp_download_multiple(
                         )
                     })?;
 
-                local_file
-                    .write_all(&contents)
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "Failed to write local file '{}': {error}",
-                            local_path.display()
-                        )
-                    })?;
+                let file_name = local_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let mut buffer = vec![0u8; 64 * 1024];
+
+                loop {
+
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        drop(local_file);
+
+                        let _ = tokio::fs::remove_file(&local_path).await;
+
+                        return Err("Transfert annulé.".to_string());
+                    }
+
+                    let bytes_read = remote_file
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "Failed to read remote file '{remote_path}': {error}"
+                            )
+                        })?;
+
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    local_file
+                        .write_all(&buffer[..bytes_read])
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "Failed to write local file '{}': {error}",
+                                local_path.display()
+                            )
+                        })?;
+
+                    let current_bytes = transferred_bytes
+                        .fetch_add(bytes_read as u64, Ordering::Relaxed)
+                        + bytes_read as u64;
+
+                    let progress = SftpTransferProgress {
+                        transfer_id: transfer_id.clone(),
+                        transferred_bytes: current_bytes,
+                        total_bytes,
+                        file_name: file_name.clone(),
+                        completed: false,
+                    };
+
+                    app_handle
+                        .emit("sftp-transfer-progress", progress)
+                        .map_err(|error| {
+                            format!(
+                                "Failed to emit transfer progress: {error}"
+                            )
+                        })?;
+                }
 
                 local_file
                     .flush()
@@ -3359,32 +3581,46 @@ async fn sftp_download_multiple(
         })
     }
 
-    for remote_path in remote_paths {
-        let resolved_path = sftp
-            .canonicalize(remote_path.clone())
-            .await
-            .map_err(|error| {
-                format!(
-                    "Failed to resolve remote path '{remote_path}': {error}"
-                )
-            })?;
-
+    // Télécharger chaque entrée sélectionnée.
+    for resolved_path in resolved_paths {
         let file_name = Path::new(&resolved_path)
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
-                format!("Impossible de déterminer le nom de '{resolved_path}'")
+                format!(
+                    "Impossible de déterminer le nom de '{resolved_path}'"
+                )
             })?;
 
         let destination = local_root.join(file_name);
 
         download_entry(
             &sftp,
+            app_handle.clone(),
+            transfer_id.clone(),
             resolved_path,
             destination,
+            Arc::clone(&transferred_bytes),
+            total_bytes,
+            Arc::clone(&cancel_flag),
         )
         .await?;
     }
+
+    // Report the end of the transfer.
+    let final_progress = SftpTransferProgress {
+        transfer_id,
+        transferred_bytes: transferred_bytes.load(Ordering::Relaxed),
+        total_bytes,
+        file_name: String::new(),
+        completed: true,
+    };
+
+    app_handle
+        .emit("sftp-transfer-progress", final_progress)
+        .map_err(|error| {
+            format!("Failed to emit final transfer progress: {error}")
+        })?;
 
     Ok(())
 }
@@ -4284,6 +4520,7 @@ fn ssh_agent_available() -> Result<bool, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(SftpTransferRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             init_database(app.handle())?;
@@ -4331,6 +4568,7 @@ pub fn run() {
             list_ssh_keys,
             generate_ssh_key,
             delete_ssh_key,
+            cancel_sftp_transfer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
