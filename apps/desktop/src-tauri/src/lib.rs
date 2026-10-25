@@ -4,8 +4,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use futures_util::stream::TryStreamExt;
+#[cfg(target_os = "linux")]
 use rtnetlink::new_connection;
+#[cfg(target_os = "linux")]
 use rtnetlink::packet_route::route::RouteAttribute;
 use tauri::Emitter;
 use tauri::Manager;
@@ -1094,10 +1097,35 @@ fn traceroute_host(target: String) -> Result<Vec<TracerouteHop>, String> {
     Ok(hops)
 }
 
+#[cfg(target_os = "linux")]
 fn is_interface_up(name: &str) -> bool {
     std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
         .map(|state| state.trim() == "up")
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn is_interface_up(name: &str) -> bool {
+    use std::process::Command;
+
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).Status",
+                name.replace('\'', "''")
+            ),
+        ])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim() == "Up"
+        }
+        _ => false,
+    }
 }
 
 fn parse_wifi_bitrate(value: &str) -> Option<f64> {
@@ -1221,6 +1249,7 @@ fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
     Ok(interfaces_by_name.into_values().collect())
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
     let (connection, handle, _) =
@@ -1317,6 +1346,65 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
     Ok(result)
 }
 
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
+    let script = r#"
+        Get-NetRoute |
+        Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric |
+        ConvertTo-Json -Compress
+    "#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|error| format!("Unable to query Windows routes: {error}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("Invalid route data: {error}"))?;
+
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries,
+        serde_json::Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    };
+
+    let mut routes = Vec::new();
+
+    for entry in entries {
+        let destination = entry["DestinationPrefix"].as_str().unwrap_or("").to_string();
+        if destination.is_empty() {
+            continue;
+        }
+
+        let next_hop = entry["NextHop"].as_str().unwrap_or("");
+        let interface_alias = entry["InterfaceAlias"].as_str().unwrap_or("");
+
+        routes.push(NetworkRouteInfo {
+            destination,
+            gateway: if next_hop.is_empty() || next_hop == "0.0.0.0" || next_hop == "::" {
+                None
+            } else {
+                Some(next_hop.to_string())
+            },
+            interface_name: if interface_alias.is_empty() {
+                None
+            } else {
+                Some(interface_alias.to_string())
+            },
+            metric: entry["RouteMetric"].as_u64().map(|value| value as u32),
+        });
+    }
+
+    Ok(routes)
+}
+
+#[cfg(target_os = "linux")]
 #[tauri::command]
 async fn route_lookup(target: String) -> Result<RouteLookupResult, String> {
     let target_ip: IpAddr = target
@@ -1464,6 +1552,63 @@ async fn route_lookup(target: String) -> Result<RouteLookupResult, String> {
     }
 
     best_match.ok_or_else(|| format!("No route found for {target}"))
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn route_lookup(target: String) -> Result<RouteLookupResult, String> {
+    let target_ip: IpAddr = target
+        .trim()
+        .parse()
+        .map_err(|error| format!("Adresse IP invalide : {error}"))?;
+
+    let script = format!(
+        "Find-NetRoute -RemoteIPAddress '{}' | \
+         Select-Object -First 1 DestinationPrefix, NextHop, InterfaceAlias, RouteMetric | \
+         ConvertTo-Json -Compress",
+        target_ip
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| format!("Impossible de rechercher la route : {error}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Réponse de routage invalide : {error}"))?;
+
+    let destination = value["DestinationPrefix"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if destination.is_empty() {
+        return Err(format!("Aucune route trouvée pour {target}"));
+    }
+
+    let next_hop = value["NextHop"].as_str().unwrap_or("");
+    let interface_alias = value["InterfaceAlias"].as_str().unwrap_or("");
+
+    Ok(RouteLookupResult {
+        target: target_ip.to_string(),
+        destination,
+        gateway: if next_hop.is_empty() || next_hop == "0.0.0.0" || next_hop == "::" {
+            None
+        } else {
+            Some(next_hop.to_string())
+        },
+        interface_name: if interface_alias.is_empty() {
+            None
+        } else {
+            Some(interface_alias.to_string())
+        },
+        metric: value["RouteMetric"].as_u64().map(|metric| metric as u32),
+    })
 }
 
 #[tauri::command]
@@ -1630,6 +1775,7 @@ async fn global_connectivity_test() -> Result<GlobalConnectivityResult, String> 
     })
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
     let (connection, handle, _) =
@@ -1707,6 +1853,61 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
     }
 
     Ok(result)
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
+    let script = r#"
+        Get-NetNeighbor |
+        Select-Object IPAddress, LinkLayerAddress, InterfaceAlias, State |
+        ConvertTo-Json -Compress
+    "#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|error| format!("Unable to query Windows neighbors: {error}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("Invalid neighbor data: {error}"))?;
+
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries,
+        serde_json::Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    };
+
+    let mut neighbors = Vec::new();
+
+    for entry in entries {
+        let ip_address = entry["IPAddress"].as_str().unwrap_or("").to_string();
+        if ip_address.is_empty() {
+            continue;
+        }
+
+        let mac = entry["LinkLayerAddress"].as_str().unwrap_or("");
+        let interface = entry["InterfaceAlias"].as_str().unwrap_or("—");
+        let state = entry["State"].as_str().unwrap_or("Unknown");
+
+        neighbors.push(NetworkNeighborInfo {
+            ip_address,
+            mac_address: if mac.is_empty() || mac == "00-00-00-00-00-00" {
+                None
+            } else {
+                Some(mac.replace('-', ":").to_lowercase())
+            },
+            interface_name: interface.to_string(),
+            state: state.to_string(),
+        });
+    }
+
+    Ok(neighbors)
 }
 
 #[tauri::command]
@@ -1834,10 +2035,17 @@ async fn network_discovery(
             let address = address.to_string();
 
             handles.push(tokio::task::spawn_blocking(move || {
-                let output = std::process::Command::new("ping")
-                    .args(["-c", "1", "-W", "1", &address])
-                    .output()
-                    .ok()?;
+                #[cfg(target_os = "linux")]
+                    let output = std::process::Command::new("ping")
+                        .args(["-c", "1", "-W", "1", &address])
+                        .output()
+                        .ok()?;
+
+                    #[cfg(target_os = "windows")]
+                    let output = std::process::Command::new("ping")
+                        .args(["-n", "1", "-w", "1000", &address])
+                        .output()
+                        .ok()?;
 
                 if !output.status.success() {
                     return None;

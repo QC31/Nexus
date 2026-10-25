@@ -20,10 +20,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 if-addrs = "0.15.0"
-rtnetlink = "0.23.0"
 futures-util = "0.3.34"
 tokio = { version = "1.53.1", features = ["rt", "net", "io-util"] }
 hickory-resolver = "0.26.3"
@@ -41,7 +41,10 @@ ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 dirs = "6"
-tauri-plugin-dialog = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.23.0"
+
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

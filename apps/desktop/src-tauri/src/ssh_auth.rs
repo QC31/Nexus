@@ -40,23 +40,16 @@ impl SshAgentProvider {
 
         #[cfg(windows)]
         {
-            match AgentClient::connect_pageant().await {
-                Ok(agent) => Ok(SshAgentClient::Pageant(agent)),
-                Err(pageant_error) => {
-                    match AgentClient::connect_named_pipe(
-                        r"\\.\pipe\openssh-ssh-agent",
-                    )
-                    .await
-                    {
-                        Ok(agent) => Ok(SshAgentClient::NamedPipe(agent)),
-                        Err(named_pipe_error) => Err(format!(
-                            "Failed to connect to Windows SSH Agent. \
-                             Pageant: {pageant_error}; \
-                             OpenSSH named pipe: {named_pipe_error}"
-                        )),
-                    }
-                }
-            }
+            AgentClient::connect_named_pipe(
+                r"\\.\pipe\openssh-ssh-agent",
+            )
+            .await
+            .map(SshAgentClient::NamedPipe)
+            .map_err(|error| {
+                format!(
+                    "Failed to connect to Windows OpenSSH Agent: {error}"
+                )
+            })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -76,16 +69,6 @@ impl SshAgentProvider {
         match &mut agent {
             #[cfg(unix)]
             SshAgentClient::Unix(agent) => agent
-                .request_identities()
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Failed to query SSH Agent identities: {error}"
-                    )
-                }),
-
-            #[cfg(windows)]
-            SshAgentClient::Pageant(agent) => agent
                 .request_identities()
                 .await
                 .map_err(|error| {
@@ -125,16 +108,6 @@ impl SshAgentProvider {
                 })?,
 
             #[cfg(windows)]
-            SshAgentClient::Pageant(agent) => agent
-                .request_identities()
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Failed to query SSH Agent identities: {error}"
-                    )
-                })?,
-
-            #[cfg(windows)]
             SshAgentClient::NamedPipe(agent) => agent
                 .request_identities()
                 .await
@@ -164,18 +137,6 @@ impl SshAgentProvider {
             let result = match &mut agent {
                 #[cfg(unix)]
                 SshAgentClient::Unix(agent) => {
-                    handle
-                        .authenticate_publickey_with(
-                            username,
-                            public_key.clone(),
-                            None,
-                            agent,
-                        )
-                        .await
-                }
-
-                #[cfg(windows)]
-                SshAgentClient::Pageant(agent) => {
                     handle
                         .authenticate_publickey_with(
                             username,
@@ -353,13 +314,6 @@ impl SshAuthenticationProvider for PrivateKeyProvider {
 pub enum SshAgentClient {
     #[cfg(unix)]
     Unix(AgentClient<tokio::net::UnixStream>),
-
-    #[cfg(windows)]
-    Pageant(
-        AgentClient<
-            russh::keys::agent::pageant::PageantStream,
-        >,
-    ),
 
     #[cfg(windows)]
     NamedPipe(
