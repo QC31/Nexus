@@ -8,6 +8,7 @@ import type {
 } from '../types/ssh';
 import { Card } from '../components/ui/Card';
 import { SshTerminal } from '../components/SshTerminal';
+import { useSshSessions } from "../contexts/SshSessionsContext";
 
 interface SshServerRecord {
   id: string;
@@ -105,6 +106,11 @@ export default function SshManagerPage() {
   const [sshSessionId, setSshSessionId] = useState<string | null>(null);
 
   const [sshSessionTabs, setSshSessionTabs] = useState<SshSessionTab[]>([]);
+  const { setSessions } = useSshSessions();
+  useEffect(() => {
+    setSessions(sshSessionTabs);
+  }, [sshSessionTabs, setSessions]);
+
   const [activeSshSessionTabId, setActiveSshSessionTabId] =
     useState<string | null>(null);
   const [sshSessionOutputs, setSshSessionOutputs] =
