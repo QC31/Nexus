@@ -2082,6 +2082,11 @@ fn init_database(app_handle: &tauri::AppHandle) -> Result<Connection, String> {
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+
             "#,
         )
         .map_err(|error| format!("Failed to initialize NEXUS database: {error}"))?;
@@ -5107,6 +5112,56 @@ fn list_ssh_servers(app_handle: tauri::AppHandle) -> Result<Vec<SshServerRecord>
 }
 
 #[tauri::command]
+fn get_app_settings(
+    app_handle: tauri::AppHandle,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let connection = init_database(&app_handle)?;
+
+    let mut statement = connection
+        .prepare("SELECT key, value FROM app_settings")
+        .map_err(|error| format!("Failed to prepare app settings query: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Failed to query app settings: {error}"))?;
+
+    let mut settings = std::collections::HashMap::new();
+
+    for row in rows {
+        let (key, value) =
+            row.map_err(|error| format!("Failed to read app setting: {error}"))?;
+
+        settings.insert(key, value);
+    }
+
+    Ok(settings)
+}
+
+#[tauri::command]
+fn save_app_setting(
+    app_handle: tauri::AppHandle,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    let connection = init_database(&app_handle)?;
+
+    connection
+        .execute(
+            r#"
+            INSERT INTO app_settings (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            rusqlite::params![key, value],
+        )
+        .map_err(|error| format!("Failed to save app setting: {error}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
 fn ssh_agent_available() -> Result<bool, String> {
     use crate::ssh_auth::{
         SshAgentProvider,
@@ -5144,6 +5199,8 @@ pub fn run() {
             reverse_dns_lookup,
             http_diagnostic,
             global_connectivity_test,
+            get_app_settings,
+            save_app_setting,
             list_ssh_servers,
             save_ssh_server,
             trust_ssh_host_key,
