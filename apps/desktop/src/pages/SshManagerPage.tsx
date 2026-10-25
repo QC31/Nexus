@@ -170,6 +170,50 @@ export default function SshManagerPage() {
   );
 };
 
+const deleteSelectedSftpEntries = async () => {
+  if (!selectedServer || selectedSftpEntries.length === 0) {
+    return;
+  }
+
+  const selectedNames = [...selectedSftpEntries];
+
+  const confirmed = window.confirm(
+    `Are you sure you want to permanently delete ${selectedNames.length} selected item(s)?\n\n${selectedNames.join('\n')}\n\nFolders and their contents will also be deleted.`
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  setError('');
+
+  try {
+    for (const entryName of selectedNames) {
+      const remotePath =
+        sftpCurrentPath === '/'
+          ? `/${entryName}`
+          : `${sftpCurrentPath.replace(/\/+$/, '')}/${entryName}`;
+
+      await invoke('sftp_delete_entry', {
+        serverId: selectedServer.id,
+        remotePath,
+        recursive: true,
+      });
+    }
+
+    setSelectedSftpEntries([]);
+    await loadSftpDirectory(sftpCurrentPath);
+  } catch (error) {
+    setError(
+      error instanceof Error
+        ? error.message
+        : String(error)
+    );
+
+    await loadSftpDirectory(sftpCurrentPath);
+  }
+};
+
 useEffect(() => {
   let unlisten: (() => void) | undefined;
   let active = true;
@@ -860,7 +904,7 @@ const createSftpDirectory = async () => {
   }
 };
 
-const uploadSftpFile = async () => {
+const uploadMultipleSftpFiles = async () => {
   if (!selectedServer) {
     setError('Please select an SSH server first.');
     return;
@@ -871,40 +915,69 @@ const uploadSftpFile = async () => {
   }
 
   try {
-    const selectedFile = await open({
-      multiple: false,
+    const selectedFiles = await open({
+      multiple: true,
       directory: false,
-      title: 'Sélectionner un fichier à envoyer',
+      title: 'Select files to upload',
     });
 
-    if (!selectedFile || Array.isArray(selectedFile)) {
+    if (!selectedFiles || !Array.isArray(selectedFiles) || selectedFiles.length === 0) {
       return;
     }
-
-    const fileName = selectedFile.split(/[\\/]/).pop();
-
-    if (!fileName) {
-      setError('Unable to determine the file name.');
-      return;
-    }
-
-    const remotePath =
-      sftpCurrentPath === '/'
-        ? `/${fileName}`
-        : `${sftpCurrentPath}/${fileName}`;
 
     setIsUploadingFile(true);
     setError('');
+    setSftpTransferCancelled(false);
 
-    await invoke('sftp_upload_file', {
+    await invoke('sftp_upload_multiple', {
       serverId: selectedServer.id,
-      localPath: selectedFile,
-      remotePath,
+      localPaths: selectedFiles,
+      remoteDirectory: sftpCurrentPath,
     });
 
     await loadSftpDirectory(sftpCurrentPath);
   } catch (error) {
-    console.error('Failed to upload SFTP file:', error);
+    console.error('Failed to upload multiple SFTP files:', error);
+    setError(String(error));
+  } finally {
+    setIsUploadingFile(false);
+  }
+};
+
+const uploadSftpFolder = async () => {
+  if (!selectedServer) {
+    setError('Please select an SSH server first.');
+    return;
+  }
+
+  if (isUploadingFile) {
+    return;
+  }
+
+  try {
+    const selectedFolder = await open({
+      multiple: false,
+      directory: true,
+      title: 'Select a folder to upload',
+    });
+
+    if (!selectedFolder || Array.isArray(selectedFolder)) {
+      return;
+    }
+
+    setIsUploadingFile(true);
+    setError('');
+    setSftpTransferCancelled(false);
+
+    await invoke('sftp_upload_multiple', {
+      serverId: selectedServer.id,
+      localPaths: [selectedFolder],
+      remoteDirectory: sftpCurrentPath,
+    });
+
+    await loadSftpDirectory(sftpCurrentPath);
+  } catch (error) {
+    console.error('Failed to upload SFTP folder:', error);
     setError(String(error));
   } finally {
     setIsUploadingFile(false);
@@ -1869,21 +1942,50 @@ const sftpPathSegments =
                             disabled={isLoadingSftp || isCreatingDirectory}
                             className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-[#3B171D] bg-[#160B0E] px-3 py-2 text-xs font-medium text-[#EEE5E6] transition-all duration-200 hover:border-[#71303B] hover:bg-[#271116] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#994452] disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            <span className="text-base leading-none" aria-hidden="true">+</span>
+                            <span className="text-base leading-none" aria-hidden="true">📂</span>
                             New directory
                           </button>
 
                           <button
                             type="button"
                             onClick={() => {
-                              void uploadSftpFile();
+                              void uploadMultipleSftpFiles();
                             }}
                             disabled={isLoadingSftp || isUploadingFile}
-                            className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-[#71303B] bg-gradient-to-b from-[#59212D] to-[#35131B] px-4 py-2 text-xs font-semibold text-white shadow-sm shadow-black/20 transition-all duration-200 hover:border-[#994452] hover:from-[#71303B] hover:to-[#481923] hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#C05A6A] disabled:cursor-not-allowed disabled:opacity-40"
+                            className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-[#3B171D] bg-[#160B0E] px-3 py-2 text-xs font-medium text-[#EEE5E6] transition-all duration-200 hover:border-[#71303B] hover:bg-[#271116] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#994452] disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            <span aria-hidden="true">↑</span>
-                            {isUploadingFile ? 'Upload en cours…' : 'Upload'}
+                            <span className="text-base leading-none" aria-hidden="true">📄</span>
+                            Upload files
                           </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void uploadSftpFolder();
+                            }}
+                            disabled={isLoadingSftp || isUploadingFile}
+                            className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-[#3B171D] bg-[#160B0E] px-3 py-2 text-xs font-medium text-[#EEE5E6] transition-all duration-200 hover:border-[#71303B] hover:bg-[#271116] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#994452] disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            <span className="text-base leading-none" aria-hidden="true">📁</span>
+                            Upload folder
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void deleteSelectedSftpEntries();
+                            }}
+                            disabled={
+                              isLoadingSftp ||
+                              isUploadingFile ||
+                              selectedSftpEntries.length === 0
+                            }
+                            className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-[#71303B] bg-[#271116] px-3 py-2 text-xs font-medium text-[#E8A0A8] transition-all duration-200 hover:border-[#994452] hover:bg-[#35131B] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#994452] disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            <span aria-hidden="true">🗑️</span>
+                            Delete selected
+                          </button>
+
                         </div>
 
                         {isCreateDirectoryOpen && (

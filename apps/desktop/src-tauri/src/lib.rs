@@ -15,7 +15,8 @@ use russh::client;
 use std::io::Cursor;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh_sftp::protocol::OpenFlags;
 const OUI_DATABASE: &str =
     include_str!("../../../../packages/network-core/data/oui.csv");
 
@@ -3088,6 +3089,508 @@ async fn sftp_upload_file(
 }
 
 #[tauri::command]
+async fn sftp_upload_multiple(
+    app_handle: tauri::AppHandle,
+    server_id: String,
+    local_paths: Vec<String>,
+    remote_directory: String,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if local_paths.is_empty() {
+        return Err("Aucun fichier ou dossier sélectionné.".to_string());
+    }
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    {
+        let registry = app_handle.state::<SftpTransferRegistry>();
+        let mut active = registry
+            .active
+            .lock()
+            .map_err(|_| "Impossible d'accéder au registre des transferts.".to_string())?;
+
+        active.insert(transfer_id.clone(), Arc::clone(&cancel_flag));
+    }
+
+    let _transfer_guard = SftpTransferGuard {
+        app_handle: app_handle.clone(),
+        transfer_id: transfer_id.clone(),
+    };
+
+    let connection = init_database(&app_handle)?;
+
+    let server = connection
+        .query_row(
+            r#"
+            SELECT
+                id, name, host, username, port, authentication_method,
+                private_key_path, group_name, favorite, remember_password,
+                host_key_fingerprint
+            FROM ssh_servers
+            WHERE id = ?1
+            "#,
+            params![server_id],
+            |row| {
+                Ok(SshServerRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    host: row.get(2)?,
+                    username: row.get(3)?,
+                    port: row.get(4)?,
+                    authentication_method: row.get(5)?,
+                    private_key_path: row.get(6)?,
+                    group_name: row.get(7)?,
+                    favorite: row.get(8)?,
+                    remember_password: row.get(9)?,
+                    host_key_fingerprint: row.get(10)?,
+                })
+            },
+        )
+        .map_err(|error| format!("Failed to load SSH server: {error}"))?;
+
+    let config = ssh_connection_config(&server);
+
+    let password = if server.authentication_method == "password" {
+        get_ssh_password(server.id.clone())?
+    } else {
+        None
+    };
+
+    let sftp = connect_sftp_server(
+        &config,
+        server.host_key_fingerprint.clone(),
+        password,
+    )
+    .await?;
+
+    let remote_directory = sftp
+        .canonicalize(remote_directory.clone())
+        .await
+        .map_err(|error| {
+            format!("Impossible d'accéder au dossier distant : {error}")
+        })?;
+
+    // Collecte les fichiers à transférer et les dossiers nécessaires.
+    // Chaque dossier sélectionné est créé sous son nom dans la destination.
+    let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
+    let mut directories_to_create: Vec<String> = Vec::new();
+    let mut total_bytes = 0u64;
+
+    fn remote_join(parent: &str, name: &str) -> String {
+        format!("{}/{}", parent.trim_end_matches('/'), name)
+    }
+
+    fn collect_local_entries(
+        local_path: &Path,
+        remote_path: &str,
+        files: &mut Vec<(PathBuf, String)>,
+        directories: &mut Vec<String>,
+        total_bytes: &mut u64,
+    ) -> Result<(), String> {
+        let metadata = std::fs::metadata(local_path)
+            .map_err(|error| {
+                format!("Impossible de lire '{}': {error}", local_path.display())
+            })?;
+
+        if metadata.is_file() {
+            files.push((local_path.to_path_buf(), remote_path.to_string()));
+            *total_bytes = total_bytes.saturating_add(metadata.len());
+            return Ok(());
+        }
+
+        if !metadata.is_dir() {
+            return Err(format!(
+                "'{}' n'est ni un fichier ordinaire ni un dossier.",
+                local_path.display()
+            ));
+        }
+
+        directories.push(remote_path.to_string());
+
+        let entries = std::fs::read_dir(local_path)
+            .map_err(|error| {
+                format!(
+                    "Impossible de lire le dossier '{}': {error}",
+                    local_path.display()
+                )
+            })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Impossible de parcourir le dossier '{}': {error}",
+                    local_path.display()
+                )
+            })?;
+
+            let child_path = entry.path();
+            let child_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| {
+                    format!(
+                        "Un nom de fichier n'est pas valide en UTF-8 dans '{}'.",
+                        local_path.display()
+                    )
+                })?;
+
+            let child_remote_path = remote_join(remote_path, &child_name);
+
+            collect_local_entries(
+                &child_path,
+                &child_remote_path,
+                files,
+                directories,
+                total_bytes,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    for local_path in &local_paths {
+        let path = Path::new(local_path);
+
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!("Impossible de déterminer le nom de '{local_path}'")
+            })?;
+
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("Impossible de lire '{local_path}': {error}"))?;
+
+        let target_path = if metadata.is_dir() {
+            remote_join(&remote_directory, name)
+        } else {
+            remote_join(&remote_directory, name)
+        };
+
+        collect_local_entries(
+            path,
+            &target_path,
+            &mut files_to_upload,
+            &mut directories_to_create,
+            &mut total_bytes,
+        )?;
+    }
+
+    // Crée d'abord les dossiers, des parents vers les enfants.
+    let created_paths: Arc<Mutex<Vec<(String, bool)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    let transfer_result: Result<(), String> = async {
+        for directory in &directories_to_create {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err("Transfert annulé.".to_string());
+            }
+
+            sftp.create_dir(directory.clone())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Impossible de créer le dossier distant '{directory}' (il existe peut-être déjà): {error}"
+                    )
+                })?;
+
+            created_paths
+                .lock()
+                .map_err(|_| "Impossible d'accéder aux éléments créés.".to_string())?
+                .push((directory.clone(), true));
+        }
+
+        let transferred_bytes = Arc::new(AtomicU64::new(0));
+
+        for (local_path, remote_path) in &files_to_upload {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err("Transfert annulé.".to_string());
+            }
+
+            let file_name = local_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file")
+                .to_string();
+
+            let mut local_file = tokio::fs::File::open(local_path)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Impossible d'ouvrir '{}': {error}",
+                        local_path.display()
+                    )
+                })?;
+
+            let mut remote_file = sftp
+                .open_with_flags(
+                    remote_path.clone(),
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Impossible de créer '{remote_path}' (le fichier existe peut-être déjà): {error}"
+                    )
+                })?;
+
+            created_paths
+                .lock()
+                .map_err(|_| "Impossible d'accéder aux éléments créés.".to_string())?
+                .push((remote_path.clone(), false));
+
+            let mut buffer = vec![0u8; 64 * 1024];
+
+            loop {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Err("Transfert annulé.".to_string());
+                }
+
+                let bytes_read = local_file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Erreur de lecture de '{}': {error}",
+                            local_path.display()
+                        )
+                    })?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                remote_file
+                    .write_all(&buffer[..bytes_read])
+                    .await
+                    .map_err(|error| {
+                        format!("Erreur d'écriture de '{remote_path}': {error}")
+                    })?;
+
+                let current_bytes = transferred_bytes
+                    .fetch_add(bytes_read as u64, Ordering::Relaxed)
+                    + bytes_read as u64;
+
+                app_handle
+                    .emit(
+                        "sftp-transfer-progress",
+                        SftpTransferProgress {
+                            transfer_id: transfer_id.clone(),
+                            transferred_bytes: current_bytes,
+                            total_bytes,
+                            file_name: file_name.clone(),
+                            completed: false,
+                        },
+                    )
+                    .map_err(|error| {
+                        format!("Impossible d'envoyer la progression: {error}")
+                    })?;
+            }
+
+            remote_file
+                .shutdown()
+                .await
+                .map_err(|error| {
+                    format!("Impossible de finaliser '{remote_path}': {error}")
+                })?;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = transfer_result {
+        let paths = created_paths
+            .lock()
+            .map(|paths| paths.clone())
+            .unwrap_or_default();
+
+        // Les éléments ont été enregistrés dans l'ordre de création.
+        // On les supprime en sens inverse pour supprimer les fichiers avant les dossiers.
+        for (path, is_directory) in paths.iter().rev() {
+            if *is_directory {
+                let _ = sftp.remove_dir(path.clone()).await;
+            } else {
+                let _ = sftp.remove_file(path.clone()).await;
+            }
+        }
+
+        return Err(error);
+    }
+
+    app_handle
+        .emit(
+            "sftp-transfer-progress",
+            SftpTransferProgress {
+                transfer_id,
+                transferred_bytes: total_bytes,
+                total_bytes,
+                file_name: String::new(),
+                completed: true,
+            },
+        )
+        .map_err(|error| format!("Impossible de finaliser la progression: {error}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn sftp_delete_entry(
+    app_handle: tauri::AppHandle,
+    server_id: String,
+    remote_path: String,
+    recursive: bool,
+) -> Result<(), String> {
+    if remote_path.trim().is_empty() {
+        return Err("Le chemin distant est vide.".to_string());
+    }
+
+    let connection = init_database(&app_handle)?;
+
+    let server = connection
+        .query_row(
+            r#"
+            SELECT
+                id, name, host, username, port, authentication_method,
+                private_key_path, group_name, favorite, remember_password,
+                host_key_fingerprint
+            FROM ssh_servers
+            WHERE id = ?1
+            "#,
+            params![server_id],
+            |row| {
+                Ok(SshServerRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    host: row.get(2)?,
+                    username: row.get(3)?,
+                    port: row.get(4)?,
+                    authentication_method: row.get(5)?,
+                    private_key_path: row.get(6)?,
+                    group_name: row.get(7)?,
+                    favorite: row.get(8)?,
+                    remember_password: row.get(9)?,
+                    host_key_fingerprint: row.get(10)?,
+                })
+            },
+        )
+        .map_err(|error| format!("Failed to load SSH server: {error}"))?;
+
+    let config = ssh_connection_config(&server);
+
+    let password = if server.authentication_method == "password" {
+        get_ssh_password(server.id.clone())?
+    } else {
+        None
+    };
+
+    let sftp = connect_sftp_server(
+        &config,
+        server.host_key_fingerprint.clone(),
+        password,
+    )
+    .await?;
+
+    let canonical_path = sftp
+        .canonicalize(remote_path.clone())
+        .await
+        .map_err(|error| {
+            format!("Impossible de résoudre le chemin distant : {error}")
+        })?;
+
+    if canonical_path == "/" {
+        return Err("La suppression de la racine distante est interdite.".to_string());
+    }
+
+    let metadata = sftp
+        .metadata(canonical_path.clone())
+        .await
+        .map_err(|error| {
+            format!("Impossible de lire les informations du chemin distant : {error}")
+        })?;
+
+    if metadata.is_dir() {
+        if !recursive {
+            return Err(
+                "Ce chemin est un dossier. La suppression récursive n'est pas autorisée."
+                    .to_string(),
+            );
+        }
+
+        async fn delete_directory_contents(
+            sftp: &russh_sftp::client::SftpSession,
+            directory: &str,
+        ) -> Result<(), String> {
+            let entries = sftp
+                .read_dir(directory.to_string())
+                .await
+                .map_err(|error| {
+                    format!("Impossible de lire le dossier '{directory}': {error}")
+                })?;
+
+            for entry in entries {
+                let name = entry.file_name();
+
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let child_path = format!(
+                    "{}/{}",
+                    directory.trim_end_matches('/'),
+                    name
+                );
+
+                let child_metadata = sftp
+                    .metadata(child_path.clone())
+                    .await
+                    .map_err(|error| {
+                        format!("Impossible de lire '{child_path}': {error}")
+                    })?;
+
+                if child_metadata.is_dir() {
+                    Box::pin(delete_directory_contents(sftp, &child_path)).await?;
+
+                    sftp.remove_dir(child_path.clone())
+                        .await
+                        .map_err(|error| {
+                            format!("Impossible de supprimer le dossier '{child_path}': {error}")
+                        })?;
+                } else {
+                    sftp.remove_file(child_path.clone())
+                        .await
+                        .map_err(|error| {
+                            format!("Impossible de supprimer le fichier '{child_path}': {error}")
+                        })?;
+                }
+            }
+
+            Ok(())
+        }
+
+        delete_directory_contents(&sftp, &canonical_path).await?;
+
+        sftp.remove_dir(canonical_path.clone())
+            .await
+            .map_err(|error| {
+                format!("Impossible de supprimer le dossier '{canonical_path}': {error}")
+            })?;
+    } else {
+        sftp.remove_file(canonical_path.clone())
+            .await
+            .map_err(|error| {
+                format!("Impossible de supprimer le fichier '{canonical_path}': {error}")
+            })?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn sftp_download_file(
     app_handle: tauri::AppHandle,
     server_id: String,
@@ -4650,6 +5153,8 @@ pub fn run() {
             sftp_list_directory,
             sftp_create_directory,
             sftp_upload_file,
+            sftp_upload_multiple,
+            sftp_delete_entry,
             sftp_download_file,
             sftp_download_multiple,
             ssh_connection_history,
