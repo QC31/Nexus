@@ -2,3 +2,6 @@ packages:
   - 'apps/*'
   - 'packages/*'
   - 'services/*'
+
+overrides:
+  source-map-js: ^1.2.2
