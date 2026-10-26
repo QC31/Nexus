@@ -353,41 +353,123 @@ useEffect(() => {
   const [customPorts, setCustomPorts] = useState("");
 
 useEffect(() => {
-  const loadInterfaces = () => {
-    invoke<NetworkInterfaceInfo[]>("network_interfaces")
-      .then(setInterfaces)
-      .catch((error) => {
+  let cancelled = false;
+  const isWindows = navigator.userAgent.includes("Windows");
+
+  const loadInterfaces = async () => {
+    try {
+      const initialInterfaces = await invoke<NetworkInterfaceInfo[]>(
+        "network_interfaces",
+      );
+
+      if (!cancelled) {
+        setInterfaces(initialInterfaces);
+      }
+    } catch (error) {
+      if (!cancelled) {
         setError(String(error));
-      });
+      }
+    }
   };
 
-  loadInterfaces();
+  const loadInitialNetworkData = async () => {
+    console.log("[NetToolBox] Début loadInitialNetworkData");
+    console.log("[NetToolBox] Windows détecté :", isWindows);
 
-  const interfacesInterval = window.setInterval(loadInterfaces, 2000);
+    try {
+      if (isWindows) {
+        console.log("[NetToolBox] Appel net_toolbox_initial_data");
 
-  invoke<NetworkRouteInfo[]>("network_routes")
-    .then(setRoutes)
-    .catch((error) => {
-      console.error("Failed to load network routes:", error);
-    });
+        const result = await invoke<{
+          routes: NetworkRouteInfo[];
+          neighbors: NetworkNeighborInfo[];
+          dns_info: DnsInfo;
+        }>("net_toolbox_initial_data");
 
-  invoke<NetworkNeighborInfo[]>("network_neighbors")
-    .then(setNeighbors)
-    .catch((error) => {
-      console.error("Failed to load network neighbors:", error);
-    });
+        // Ne pas poursuivre si cet effet a été annulé par React StrictMode.
+        if (cancelled) {
+          return;
+        }
 
-  invoke<DnsInfo>("dns_info")
-    .then(setDnsInfo)
-    .catch((error) => {
-      console.error("Failed to load DNS information:", error);
-    });
+        setRoutes(result.routes);
+        setNeighbors(result.neighbors);
+        setDnsInfo(result.dns_info);
 
-  return () => {
-    window.clearInterval(interfacesInterval);
+        // Les états des adaptateurs sont maintenant en cache.
+        // Charger les interfaces uniquement pour l'effet actif.
+        await loadInterfaces();
+
+      } else {
+        // Conserver le comportement existant sur les autres systèmes.
+        const [neighbors, routes, dnsInfo] = await Promise.all([
+          invoke<NetworkNeighborInfo[]>("network_neighbors"),
+          invoke<NetworkRouteInfo[]>("network_routes"),
+          invoke<DnsInfo>("dns_info"),
+        ]);
+
+        if (!cancelled) {
+          setNeighbors(neighbors);
+          setRoutes(routes);
+          setDnsInfo(dnsInfo);
+        }
+      }
+    } catch (error) {
+      if (!cancelled) {
+        console.error("[NetToolBox] Échec du chargement initial :", error);
+        setError(String(error));
+      }
+    }
   };
+
+  if (isWindows) {
+    // Windows : collecte groupée, puis chargement des interfaces.
+    void loadInitialNetworkData();
+  } else {
+    // Autres systèmes : conserver le chargement parallèle.
+    void loadInterfaces();
+    void loadInitialNetworkData();
+  }
+
+// Actualiser les interfaces réseau toutes les 10 secondes.
+const interfacesInterval = window.setInterval(() => {
+if (!cancelled) {
+void loadInterfaces();
+}
+}, 10_000);
+
+// Sous Windows, rafraîchir aussi l'état des adaptateurs toutes les 30 secondes.
+const interfaceStatesInterval = isWindows
+? window.setInterval(async () => {
+if (cancelled) {
+return;
+}
+
+    try {
+      await invoke("refresh_interface_states");
+
+      if (!cancelled) {
+        await loadInterfaces();
+      }
+    } catch (error) {
+      console.error(
+        "[NetToolBox] Échec du rafraîchissement des états des interfaces :",
+        error,
+      );
+    }
+  }, 30_000)
+: undefined;
+
+return () => {
+cancelled = true;
+window.clearInterval(interfacesInterval);
+
+
+if (interfaceStatesInterval !== undefined) {
+  window.clearInterval(interfaceStatesInterval);
+}
+
+};
 }, []);
-
 
 
 const neighborInterfaces = Array.from(

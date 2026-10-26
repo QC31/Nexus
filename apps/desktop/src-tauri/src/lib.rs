@@ -42,7 +42,7 @@ struct NetworkInterfaceInfo {
     wifi_tx_bitrate_mbps: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct NetworkRouteInfo {
     destination: String,
     gateway: Option<String>,
@@ -59,7 +59,7 @@ struct RouteLookupResult {
     metric: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct NetworkNeighborInfo {
     ip_address: String,
     mac_address: Option<String>,
@@ -117,11 +117,18 @@ fn lookup_mac_vendor(mac_address: &str) -> Option<String> {
         })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct DnsInfo {
     interface_name: Option<String>,
     current_server: Option<String>,
     servers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct NetToolBoxInitialData {
+    routes: Vec<NetworkRouteInfo>,
+    neighbors: Vec<NetworkNeighborInfo>,
+    dns_info: DnsInfo,
 }
 
 #[derive(Debug, Serialize)]
@@ -1108,15 +1115,17 @@ fn is_interface_up(name: &str) -> bool {
 fn is_interface_up(name: &str) -> bool {
     use std::process::Command;
 
+    let script = format!(
+        "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).Status",
+        name.replace('\'', "''")
+    );
+
     let output = Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!(
-                "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).Status",
-                name.replace('\'', "''")
-            ),
+            &script,
         ])
         .output();
 
@@ -1128,6 +1137,111 @@ fn is_interface_up(name: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "windows")]
+static INTERFACE_STATES_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, BTreeMap<String, bool>)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static INTERFACE_STATES_REFRESH_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn get_cached_interface_states() -> Option<BTreeMap<String, bool>> {
+    let cache = INTERFACE_STATES_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None));
+
+    let guard = cache.lock().ok()?;
+
+    guard
+        .as_ref()
+        .map(|(_, states)| states.clone())
+}
+
+#[cfg(target_os = "windows")]
+fn get_interface_states() -> BTreeMap<String, bool> {
+    let refresh_lock = INTERFACE_STATES_REFRESH_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()));
+
+    let _refresh_guard = match refresh_lock.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("[NetToolBox] Verrou de rafraîchissement indisponible : {error}");
+            return BTreeMap::new();
+        }
+    };
+
+    let cache = INTERFACE_STATES_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some((timestamp, states)) = guard.as_ref() {
+            if timestamp.elapsed() < std::time::Duration::from_secs(10) {
+                eprintln!("[NetToolBox] Cache utilisé : états des interfaces");
+                return states.clone();
+            } else {
+                eprintln!("[NetToolBox] Cache expiré : nouvel appel PowerShell");
+            }
+        }
+    }
+    use std::process::Command;
+
+    let script = "Get-NetAdapter | Select-Object -Property Name, Status | ConvertTo-Json -Compress";
+
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .output();
+
+    let Ok(output) = output else {
+        return BTreeMap::new();
+    };
+
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return BTreeMap::new();
+    };
+
+    let mut states = BTreeMap::new();
+
+    let adapters = match value {
+        serde_json::Value::Array(adapters) => adapters,
+        serde_json::Value::Object(_) => vec![value],
+        _ => return states,
+    };
+
+    for adapter in adapters {
+        let Some(name) = adapter.get("Name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let is_up = adapter
+            .get("Status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|status| status == "Up");
+
+        states.insert(name.to_string(), is_up);
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), states.clone()));
+        eprintln!("[NetToolBox] Cache des interfaces mis à jour");
+    } else {
+        eprintln!("[NetToolBox] Impossible de verrouiller le cache");
+    }
+
+    states
+}
+
 fn parse_wifi_bitrate(value: &str) -> Option<f64> {
     value
         .split_whitespace()
@@ -1135,66 +1249,129 @@ fn parse_wifi_bitrate(value: &str) -> Option<f64> {
         .and_then(|number| number.parse::<f64>().ok())
 }
 
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn refresh_interface_states() -> Result<(), String> {
+    let start = std::time::Instant::now();
+    eprintln!("[NetToolBox] Début refresh_interface_states");
+
+    tokio::task::spawn_blocking(|| {
+        get_interface_states();
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    eprintln!(
+        "[NetToolBox] Fin refresh_interface_states : {:?}",
+        start.elapsed()
+    );
+
+    Ok(())
+}
+
 #[tauri::command]
 fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
-    let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
+    eprintln!("[NetToolBox] Début network_interfaces");
+    let debug_start = std::time::Instant::now();
+
+#[cfg(target_os = "windows")]
+let interface_states = get_cached_interface_states().unwrap_or_default();
+
+let if_addrs_start = std::time::Instant::now();
+let interfaces = if_addrs::get_if_addrs().map_err(|error| {
+    eprintln!("[NetToolBox] Erreur if_addrs : {error}");
+    error.to_string()
+})?;
+
+eprintln!(
+    "[NetToolBox] Durée if_addrs::get_if_addrs : {:?}",
+    if_addrs_start.elapsed()
+);
+
+eprintln!(
+    "[NetToolBox] Interfaces détectées : {}",
+    interfaces.len()
+);
 
     let mut interfaces_by_name = BTreeMap::<String, NetworkInterfaceInfo>::new();
 
     for interface in interfaces {
+        eprintln!(
+            "[NetToolBox] Traitement interface : {}",
+            interface.name
+        );
         let is_loopback = interface.is_loopback();
 
+
+        eprintln!(
+            "[NetToolBox] Préparation des informations : {}",
+            interface.name
+        );
         let entry = interfaces_by_name
             .entry(interface.name.clone())
             .or_insert_with(|| {
-                let wifi_info = std::process::Command::new("iw")
-                    .args(["dev", &interface.name, "link"])
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .map(|output| {
-                        let text = String::from_utf8_lossy(&output.stdout);
 
-                        let wifi_ssid = text.lines().find_map(|line| {
-                            line.trim()
-                                .strip_prefix("SSID:")
-                                .map(str::trim)
-                                .map(str::to_string)
-                        });
+            eprintln!(
+                "[NetToolBox] Début commande iw : {}",
+                interface.name
+            );
 
-                        let wifi_rx_bitrate_mbps = text.lines().find_map(|line| {
-                            let line = line.trim();
+            let wifi_output = std::process::Command::new("iw")
+                .args(["dev", &interface.name, "link"])
+                .output();
 
-                            if let Some(value) = line.strip_prefix("rx bitrate:") {
-                                return parse_wifi_bitrate(value);
-                            }
+            eprintln!(
+                "[NetToolBox] Fin commande iw : {}",
+                interface.name
+            );
 
-                            None
-                        });
+            let wifi_info = wifi_output
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| {
+                    let text = String::from_utf8_lossy(&output.stdout);
 
-                        let wifi_tx_bitrate_mbps = text.lines().find_map(|line| {
-                            let line = line.trim();
+                    let wifi_ssid = text.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix("SSID:")
+                            .map(str::trim)
+                            .map(str::to_string)
+                    });
 
-                            if let Some(value) = line.strip_prefix("tx bitrate:") {
-                                return parse_wifi_bitrate(value);
-                            }
+                    let wifi_rx_bitrate_mbps = text.lines().find_map(|line| {
+                        let line = line.trim();
+                        line.strip_prefix("rx bitrate:")
+                            .and_then(parse_wifi_bitrate)
+                    });
 
-                            None
-                        });
+                    let wifi_tx_bitrate_mbps = text.lines().find_map(|line| {
+                        let line = line.trim();
+                        line.strip_prefix("tx bitrate:")
+                            .and_then(parse_wifi_bitrate)
+                    });
 
-                        (
-                            wifi_ssid,
-                            wifi_rx_bitrate_mbps,
-                            wifi_tx_bitrate_mbps,
-                        )
-                    })
-                    .unwrap_or((None, None, None));
+                    (
+                        wifi_ssid,
+                        wifi_rx_bitrate_mbps,
+                        wifi_tx_bitrate_mbps,
+                    )
+                })
+                .unwrap_or((None, None, None));
+
+                #[cfg(target_os = "windows")]
+                let interface_is_up = interface_states
+                    .get(&interface.name)
+                    .copied()
+                    .unwrap_or(false);
+
+                #[cfg(target_os = "linux")]
+                let interface_is_up = is_interface_up(&interface.name);
 
                 NetworkInterfaceInfo {
                     name: interface.name.clone(),
                     ipv4_addresses: Vec::new(),
                     ipv6_addresses: Vec::new(),
-                    is_up: is_interface_up(&interface.name),
+                    is_up: interface_is_up,
                     is_loopback,
                     wifi_ssid: wifi_info.0,
                     wifi_rx_bitrate_mbps: wifi_info.1,
@@ -1210,9 +1387,21 @@ fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
                 }
 
                 if entry.ipv6_addresses.is_empty() {
-                    let ipv6_output = std::process::Command::new("ip")
+                    eprintln!(
+                        "[NetToolBox] Début commande IPv6 : {}",
+                        interface.name
+                    );
+
+                    let ipv6_result = std::process::Command::new("ip")
                         .args(["-6", "addr", "show", "dev", &interface.name])
-                        .output()
+                        .output();
+
+                    eprintln!(
+                        "[NetToolBox] Fin commande IPv6 : {}",
+                        interface.name
+                    );
+
+                    let ipv6_output = ipv6_result
                         .ok()
                         .filter(|output| output.status.success());
 
@@ -1245,6 +1434,15 @@ fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
                     }
                 }
     }
+    eprintln!(
+        "[NetToolBox] Fin du traitement. Interfaces regroupées : {}",
+        interfaces_by_name.len()
+    );
+
+    eprintln!(
+        "[NetToolBox] Durée totale network_interfaces : {:?}",
+        debug_start.elapsed()
+        );
 
     Ok(interfaces_by_name.into_values().collect())
 }
@@ -1349,16 +1547,21 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
+    let start = std::time::Instant::now();
     let script = r#"
         Get-NetRoute |
         Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric |
         ConvertTo-Json -Compress
     "#;
 
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .map_err(|error| format!("Unable to query Windows routes: {error}"))?;
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+    })
+    .await
+    .map_err(|error| format!("Windows routes task failed: {error}"))?
+    .map_err(|error| format!("Unable to query Windows routes: {error}"))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -1400,6 +1603,11 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
             metric: entry["RouteMetric"].as_u64().map(|value| value as u32),
         });
     }
+
+    eprintln!(
+        "[NetToolBox] network_routes terminé en {:?}",
+        start.elapsed()
+    );
 
     Ok(routes)
 }
@@ -1858,16 +2066,21 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
+    let start = std::time::Instant::now();
     let script = r#"
         Get-NetNeighbor |
         Select-Object IPAddress, LinkLayerAddress, InterfaceAlias, State |
         ConvertTo-Json -Compress
     "#;
 
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .map_err(|error| format!("Unable to query Windows neighbors: {error}"))?;
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+    })
+    .await
+    .map_err(|error| format!("Windows neighbors task failed: {error}"))?
+    .map_err(|error| format!("Unable to query Windows neighbors: {error}"))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -1906,6 +2119,11 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
             state: state.to_string(),
         });
     }
+
+    eprintln!(
+        "[NetToolBox] network_neighbors terminé en {:?}",
+        start.elapsed()
+    );
 
     Ok(neighbors)
 }
@@ -2136,6 +2354,7 @@ async fn network_discovery(
     Ok(result)
 }
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 fn dns_info() -> Result<DnsInfo, String> {
     let output = std::process::Command::new("resolvectl")
@@ -2152,7 +2371,6 @@ fn dns_info() -> Result<DnsInfo, String> {
     let mut interface_name = None;
     let mut current_server = None;
     let mut servers = Vec::new();
-
     let mut current_interface = None;
     let mut dns_scope_active = false;
 
@@ -2198,6 +2416,352 @@ fn dns_info() -> Result<DnsInfo, String> {
         current_server,
         servers,
     })
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn dns_info() -> Result<DnsInfo, String> {
+    let start = std::time::Instant::now();
+
+    let script = r#"
+        Get-DnsClientServerAddress |
+        Where-Object { $_.ServerAddresses.Count -gt 0 } |
+        Select-Object InterfaceAlias, ServerAddresses |
+        ConvertTo-Json -Compress
+    "#;
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+    })
+    .await
+    .map_err(|error| format!("Tâche DNS Windows échouée : {error}"))?
+    .map_err(|error| format!("Impossible de récupérer les DNS : {error}"))?;
+
+    if !output.status.success() {
+        return Err(
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .to_string(),
+        );
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("Réponse DNS Windows invalide : {error}"))?;
+
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries,
+        serde_json::Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    };
+
+    let mut interface_name = None;
+    let mut servers = Vec::new();
+
+    for entry in entries {
+        let alias = entry["InterfaceAlias"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        if interface_name.is_none() && !alias.is_empty() {
+            interface_name = Some(alias);
+        }
+
+        if let Some(addresses) = entry["ServerAddresses"].as_array() {
+            for address in addresses {
+                if let Some(address) = address.as_str() {
+                    if !address.is_empty() && !servers.contains(&address.to_string()) {
+                        servers.push(address.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let current_server = servers.first().cloned();
+
+    eprintln!(
+        "[NetToolBox] dns_info terminé en {:?}",
+        start.elapsed()
+    );
+
+    Ok(DnsInfo {
+        interface_name,
+        current_server,
+        servers,
+    })
+}
+
+#[cfg(target_os = "windows")]
+static NET_TOOLBOX_INITIAL_DATA_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, NetToolBoxInitialData)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static NET_TOOLBOX_INITIAL_DATA_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn net_toolbox_initial_data() -> Result<NetToolBoxInitialData, String> {
+    let start = std::time::Instant::now();
+
+let _initial_data_guard = NET_TOOLBOX_INITIAL_DATA_LOCK
+    .get_or_init(|| tokio::sync::Mutex::new(()))
+    .lock()
+    .await;
+
+let cache = NET_TOOLBOX_INITIAL_DATA_CACHE
+    .get_or_init(|| std::sync::Mutex::new(None));
+
+if let Ok(guard) = cache.lock() {
+    if let Some((timestamp, data)) = guard.as_ref() {
+        if timestamp.elapsed() < std::time::Duration::from_secs(5) {
+            eprintln!(
+                "[NetToolBox] Cache des données initiales utilisé : {:?}",
+                timestamp.elapsed()
+            );
+            return Ok(data.clone());
+        }
+    }
+}
+
+eprintln!("[NetToolBox] >>> Collecte initiale des données réseau");
+
+    let script = r#"
+    $ErrorActionPreference = 'Stop'
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [Console]::OutputEncoding = $utf8NoBom
+    $OutputEncoding = $utf8NoBom
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $routes = @(
+        Get-NetRoute |
+        Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric
+    )
+    [Console]::Error.WriteLine("[NetToolBox timing] Get-NetRoute: $($timer.ElapsedMilliseconds) ms")
+
+    $timer.Restart()
+    $neighbors = @(
+        Get-NetNeighbor |
+        Select-Object IPAddress, LinkLayerAddress, InterfaceAlias, State
+    )
+    [Console]::Error.WriteLine("[NetToolBox timing] Get-NetNeighbor: $($timer.ElapsedMilliseconds) ms")
+
+    $timer.Restart()
+    $dns = @(
+        Get-DnsClientServerAddress |
+        Where-Object { $_.ServerAddresses.Count -gt 0 } |
+        Select-Object InterfaceAlias, ServerAddresses
+    )
+    [Console]::Error.WriteLine("[NetToolBox timing] Get-DnsClientServerAddress: $($timer.ElapsedMilliseconds) ms")
+
+    $timer.Restart()
+    $adapters = @(
+        Get-NetAdapter |
+        Select-Object Name, Status
+    )
+    [Console]::Error.WriteLine("[NetToolBox timing] Get-NetAdapter: $($timer.ElapsedMilliseconds) ms")
+
+    @{
+        routes = $routes
+        neighbors = $neighbors
+        dns = $dns
+        adapters = $adapters
+    } | ConvertTo-Json -Depth 5 -Compress
+    "#;
+
+    let output = tokio::task::spawn_blocking(move || {
+        eprintln!("[NetToolBox] Lancement du processus PowerShell groupé");
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+    })
+    .await
+    .map_err(|error| format!("Échec de la tâche réseau initiale : {error}"))?
+    .map_err(|error| format!("Impossible de récupérer les données réseau : {error}"))?;
+
+    eprintln!(
+        "[NetToolBox] PowerShell terminé : succès={}, code={:?}, stdout={} octets, stderr={} octets",
+        output.status.success(),
+        output.status.code(),
+        output.stdout.len(),
+        output.stderr.len()
+    );
+
+    if !output.stderr.is_empty() {
+        eprintln!(
+            "[NetToolBox] Mesures PowerShell :\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    eprintln!(
+        "[NetToolBox] Sortie PowerShell UTF-8 valide : {}",
+        std::str::from_utf8(&output.stdout).is_ok()
+    );
+
+    if !output.status.success() {
+        return Err(format!(
+            "PowerShell a échoué : {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Réponse réseau JSON invalide : {error}"))?;
+
+    eprintln!("[NetToolBox] JSON analysé correctement");
+    eprintln!(
+        "[NetToolBox] Clés JSON reçues : {:?}",
+        json.as_object()
+            .map(|object| object.keys().collect::<Vec<_>>())
+    );
+
+    let as_array = |value: &serde_json::Value| -> Vec<serde_json::Value> {
+        match value {
+            serde_json::Value::Array(items) => items.clone(),
+            serde_json::Value::Object(_) => vec![value.clone()],
+            _ => Vec::new(),
+        }
+    };
+
+    let routes = as_array(&json["routes"])
+        .into_iter()
+        .filter_map(|item| {
+            let destination = item["DestinationPrefix"].as_str()?.to_string();
+
+            if destination.is_empty() {
+                return None;
+            }
+
+            let next_hop = item["NextHop"].as_str().unwrap_or_default().to_string();
+            let interface_alias = item["InterfaceAlias"].as_str().unwrap_or_default().to_string();
+
+            Some(NetworkRouteInfo {
+                destination,
+                gateway: if next_hop.is_empty() || next_hop == "0.0.0.0" || next_hop == "::" {
+                    None
+                } else {
+                    Some(next_hop)
+                },
+                interface_name: if interface_alias.is_empty() {
+                    None
+                } else {
+                    Some(interface_alias)
+                },
+                metric: item["RouteMetric"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok()),
+            })
+        })
+        .collect();
+
+    let neighbors = as_array(&json["neighbors"])
+        .into_iter()
+        .filter_map(|item| {
+            let ip_address = item["IPAddress"].as_str()?.to_string();
+
+            if ip_address.is_empty() {
+                return None;
+            }
+
+            let raw_mac = item["LinkLayerAddress"].as_str().unwrap_or_default().to_string();
+            let interface_alias = item["InterfaceAlias"].as_str().unwrap_or_default().to_string();
+            let state = item["State"].as_str().unwrap_or("Unknown").to_string();
+
+            Some(NetworkNeighborInfo {
+                ip_address,
+                mac_address: if raw_mac.is_empty() || raw_mac == "00-00-00-00-00-00" {
+                    None
+                } else {
+                    Some(raw_mac.replace('-', ":").to_lowercase())
+                },
+                interface_name: if interface_alias.is_empty() {
+                    "—".to_string()
+                } else {
+                    interface_alias
+                },
+                state,
+            })
+        })
+        .collect();
+
+    let dns_items = as_array(&json["dns"]);
+    let mut dns_servers = Vec::new();
+    let mut dns_interface = None;
+
+    for item in dns_items {
+        let alias = item["InterfaceAlias"].as_str().unwrap_or_default().to_string();
+
+        if dns_interface.is_none() && !alias.is_empty() {
+            dns_interface = Some(alias);
+        }
+
+        for server in as_array(&item["ServerAddresses"]) {
+            if let Some(server) = server.as_str() {
+                if !server.is_empty() && !dns_servers.iter().any(|existing| existing == server) {
+                    dns_servers.push(server.to_string());
+                }
+            }
+        }
+    }
+
+    let dns_info = DnsInfo {
+        interface_name: dns_interface,
+        current_server: dns_servers.first().cloned(),
+        servers: dns_servers,
+    };
+
+    let mut interface_states = BTreeMap::new();
+
+    for item in as_array(&json["adapters"]) {
+        let name = item["Name"].as_str().unwrap_or_default().to_string();
+        let status = item["Status"].as_str().unwrap_or_default();
+
+        if !name.is_empty() {
+            interface_states.insert(name, status.eq_ignore_ascii_case("Up"));
+        }
+    }
+
+    eprintln!("[NetToolBox] États des adaptateurs reçus : {:?}", interface_states);
+
+    eprintln!(
+        "[NetToolBox] Nombre d'adaptateurs analysés : {}",
+        interface_states.len()
+    );
+
+        let interface_cache = INTERFACE_STATES_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None));
+
+    if let Ok(mut guard) = interface_cache.lock() {
+        *guard = Some((std::time::Instant::now(), interface_states));
+    }
+
+    let data = NetToolBoxInitialData {
+        routes,
+        neighbors,
+        dns_info,
+    };
+
+    let initial_data_cache = NET_TOOLBOX_INITIAL_DATA_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None));
+
+    if let Ok(mut guard) = initial_data_cache.lock() {
+        *guard = Some((std::time::Instant::now(), data.clone()));
+    }
+
+    eprintln!(
+        "[NetToolBox] Chargement réseau groupé terminé : {:?}",
+        start.elapsed()
+    );
+
+    Ok(data)
 }
 
 fn ssh_credential_entry(server_id: &str) -> Result<Entry, String> {
@@ -5393,11 +5957,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             network_interfaces,
+            refresh_interface_states,
             network_routes,
             route_lookup,
             network_neighbors,
             network_discovery,
             dns_info,
+            net_toolbox_initial_data,
             ping_host,
             tcp_check,
             port_scan,
