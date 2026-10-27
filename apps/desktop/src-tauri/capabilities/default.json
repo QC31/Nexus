@@ -4,9 +4,11 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "opener:default",
-    "dialog:allow-open",
-    "dialog:allow-save"
-  ]
+  "core:default",
+  "opener:default",
+  "dialog:allow-open",
+  "dialog:allow-save",
+  "dialog:allow-confirm",
+  "dialog:allow-message"
+]
 }

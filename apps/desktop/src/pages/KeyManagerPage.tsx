@@ -23,6 +23,8 @@ export default function KeyManagerPage() {
   const [keyToDelete, setKeyToDelete] = useState<SshKeyInfo | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
+  const [confirmSensitiveActions, setConfirmSensitiveActions] =
+    useState(true);
 
   const loadKeys = async () => {
     setIsLoading(true);
@@ -38,9 +40,27 @@ export default function KeyManagerPage() {
     }
   };
 
-  useEffect(() => {
-    void loadKeys();
-  }, []);
+useEffect(() => {
+  void loadKeys();
+
+  const loadAppSettings = async () => {
+    try {
+      const settings = await invoke<Record<string, string>>(
+        'get_app_settings',
+      );
+
+      setConfirmSensitiveActions(
+        settings.confirm_sensitive_actions !== 'false',
+      );
+    } catch (error) {
+      console.error('Failed to load app settings:', error);
+      // Keep confirmation enabled if settings cannot be loaded.
+      setConfirmSensitiveActions(true);
+    }
+  };
+
+  void loadAppSettings();
+}, []);
 
   const closeGenerateModal = () => {
     if (isGenerating) {
@@ -188,7 +208,28 @@ export default function KeyManagerPage() {
                       type="button"
                       onClick={() => {
                         setDeleteError("");
-                        setKeyToDelete(key);
+
+                        if (confirmSensitiveActions) {
+                          setKeyToDelete(key);
+                          return;
+                        }
+
+                        void (async () => {
+                          setIsDeleting(true);
+
+                          try {
+                            await invoke("delete_ssh_key", {
+                              path: key.path,
+                            });
+
+                            setKeyToDelete(null);
+                            await loadKeys();
+                          } catch (error) {
+                            setDeleteError(String(error));
+                          } finally {
+                            setIsDeleting(false);
+                          }
+                        })();
                       }}
                       className="shrink-0 rounded-md border border-red-900/60 px-2.5 py-1.5 text-[10px] font-semibold text-red-400 transition hover:border-red-700 hover:bg-red-950/30"
                     >

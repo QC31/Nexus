@@ -23,6 +23,15 @@ use russh_sftp::protocol::OpenFlags;
 const OUI_DATABASE: &str =
     include_str!("../../../../packages/network-core/data/oui.csv");
 
+#[cfg(target_os = "windows")]
+fn hidden_powershell_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new("powershell");
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    command
+}
+
 #[derive(Debug, Serialize)]
 struct Ipv6AddressInfo {
     address: String,
@@ -530,89 +539,235 @@ async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
 
 #[tauri::command]
 fn ping_host(target: String) -> Result<PingResult, String> {
+    #[cfg(target_os = "windows")]
+    let output = {
+        let mut command = std::process::Command::new("ping");
+        command
+            .args(["-n", "4", "-w", "2000", &target])
+            .env("LANG", "en_US.UTF-8")
+            .env("LC_ALL", "en_US.UTF-8");
+
+        command
+            .output()
+            .map_err(|error| format!("Unable to start Ping: {error}"))?
+    };
+
+    #[cfg(not(target_os = "windows"))]
     let output = std::process::Command::new("ping")
         .args(["-c", "4", "-W", "2", &target])
         .output()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Impossible de lancer Ping : {error}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if !output.status.success() && !stdout.contains("packet loss") {
+    if !output.status.success() && stdout.trim().is_empty() {
         return Err(if !stderr.trim().is_empty() {
             stderr.trim().to_string()
         } else {
-            format!("Ping failed for {target}")
+            format!("Ping n'a retourné aucun résultat pour {target}")
         });
     }
 
-    let mut sent = 0;
-    let mut received = 0;
+    let mut sent = 0u32;
+    let mut received = 0u32;
     let mut packet_loss = 100.0;
-    let mut min_ms = None;
-    let mut avg_ms = None;
-    let mut max_ms = None;
-
-    let mut latencies = Vec::new();
+    let mut min_ms: Option<f64> = None;
+    let mut avg_ms: Option<f64> = None;
+    let mut max_ms: Option<f64> = None;
+    let mut latencies: Vec<f64> = Vec::new();
 
     for line in stdout.lines() {
-        if line.contains("packets transmitted") {
-            let parts: Vec<&str> = line.split(',').collect();
+        let lower = line.to_lowercase();
 
-            if let Some(value) = parts.first() {
-                sent = value
-                    .trim()
-                    .split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(0);
+        #[cfg(target_os = "windows")]
+        {
+            // Count successful replies independently of the summary language.
+            if lower.contains("bytes=") || lower.contains("octets=") {
+                received += 1;
             }
 
-            if let Some(value) = parts.get(1) {
-                received = value
-                    .trim()
-                    .split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(0);
+            // Parse the number of packets sent from the summary.
+            if lower.contains("sent") || lower.contains("envoy") {
+                for part in line.split(',') {
+                    let normalized = part.to_lowercase();
+
+                    if normalized.contains("sent") || normalized.contains("envoy") {
+                        if let Some(value) = part.split('=').nth(1) {
+                            let digits: String = value
+                                .trim()
+                                .chars()
+                                .take_while(|character| character.is_ascii_digit())
+                                .collect();
+
+                            if let Ok(count) = digits.parse::<u32>() {
+                                sent = count;
+                            }
+                        }
+                    }
+                }
             }
 
-            if let Some(value) = parts.get(2) {
-                packet_loss = value
-                    .trim()
-                    .trim_end_matches('%')
-                    .split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .unwrap_or(100.0);
-            }
-        }
+            // Parse Windows latency summary in English or French.
+            if lower.contains("minimum")
+                && lower.contains("maximum")
+                && (lower.contains("moyenne") || lower.contains("average"))
+            {
+                for part in line.split(',') {
+                    let part_lower = part.to_lowercase();
 
-        if line.contains("min/avg/max") {
-            if let Some((_, values)) = line.split_once('=') {
-                let values = values.trim().split_whitespace().next().unwrap_or("");
-                let stats: Vec<f64> = values
-                    .split('/')
-                    .filter_map(|value| value.parse::<f64>().ok())
-                    .collect();
+                    let value = part
+                        .split('=')
+                        .nth(1)
+                        .and_then(|value| {
+                            value
+                                .split_whitespace()
+                                .next()
+                                .and_then(|number| {
+                                    number.trim_end_matches("ms").parse::<f64>().ok()
+                                })
+                        });
 
-                if stats.len() >= 3 {
-                    min_ms = Some(stats[0]);
-                    avg_ms = Some(stats[1]);
-                    max_ms = Some(stats[2]);
+                    if let Some(value) = value {
+                        if part_lower.contains("minimum") {
+                            min_ms = Some(value);
+                        } else if part_lower.contains("maximum") {
+                            max_ms = Some(value);
+                        } else if part_lower.contains("moyenne")
+                            || part_lower.contains("average")
+                        {
+                            avg_ms = Some(value);
+                        }
+                    }
                 }
             }
         }
 
-        if let Some(time_part) = line.split("time=").nth(1) {
-            if let Some(value) = time_part
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse::<f64>().ok())
-            {
-                latencies.push(value);
+        #[cfg(not(target_os = "windows"))]
+        {
+            if lower.contains("packets transmitted") {
+                let parts: Vec<&str> = line.split(',').collect();
+
+                if let Some(value) = parts.first() {
+                    sent = value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(sent);
+                }
+
+                if let Some(value) = parts.get(1) {
+                    received = value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(received);
+                }
+
+                if let Some(value) = parts.get(2) {
+                    packet_loss = value
+                        .trim()
+                        .trim_end_matches('%')
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .unwrap_or(packet_loss);
+                }
+            }
+
+            if lower.contains("min/avg/max") {
+                if let Some((_, values)) = line.split_once('=') {
+                    let values = values.trim().split_whitespace().next().unwrap_or("");
+                    let stats: Vec<f64> = values
+                        .split('/')
+                        .filter_map(|value| value.parse::<f64>().ok())
+                        .collect();
+
+                    if stats.len() >= 3 {
+                        min_ms = Some(stats[0]);
+                        avg_ms = Some(stats[1]);
+                        max_ms = Some(stats[2]);
+                    }
+                }
             }
         }
+
+        // Parse individual reply latencies in English or French.
+        if let Some(index) = lower.find("time=").or_else(|| lower.find("temps=")) {
+            let prefix_length = if lower[index..].starts_with("temps=") { 6 } else { 5 };
+            let value = &line[index + prefix_length..];
+
+            if let Some(ms) = value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.trim_end_matches("ms").parse::<f64>().ok())
+            {
+                latencies.push(ms);
+            }
+        } else if let Some(index) = lower.find("time<").or_else(|| lower.find("temps<")) {
+            let prefix_length = if lower[index..].starts_with("temps<") { 6 } else { 5 };
+            let value = &line[index + prefix_length..];
+
+            if let Some(ms) = value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.trim_end_matches("ms").parse::<f64>().ok())
+            {
+                latencies.push(ms / 2.0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if sent == 0 {
+            sent = 4;
+        }
+
+        if received > sent {
+            received = sent;
+        }
+
+        if received == 0 {
+            packet_loss = 100.0;
+        } else if sent > 0 {
+            packet_loss = ((sent - received) as f64 / sent as f64) * 100.0;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if sent > 0 && received <= sent && !stdout.to_ascii_lowercase().contains("packet loss") {
+            packet_loss = ((sent - received) as f64 / sent as f64) * 100.0;
+        }
+    }
+
+    if sent == 0 && received == 0 {
+        return Err(if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            format!("Impossible d'analyser les résultats Ping pour {target}")
+        });
+    }
+
+    if !output.status.success() && received == 0 {
+        // Un hôte injoignable reste un résultat valide : 100 % de pertes.
+        packet_loss = 100.0;
+    }
+
+    if !output.status.success() && received > 0 {
+        // Certaines réponses peuvent avoir été reçues malgré un code de sortie non nul.
+        packet_loss = ((sent.saturating_sub(received)) as f64 / sent.max(1) as f64) * 100.0;
+    }
+
+    if !latencies.is_empty() {
+        let measured_min = latencies.iter().copied().fold(f64::INFINITY, f64::min);
+        let measured_max = latencies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let measured_avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
+
+        min_ms = min_ms.or(Some(measured_min));
+        max_ms = max_ms.or(Some(measured_max));
+        avg_ms = avg_ms.or(Some(measured_avg));
     }
 
     let jitter_ms = if latencies.len() >= 2 {
@@ -621,9 +776,7 @@ fn ping_host(target: String) -> Result<PingResult, String> {
             .map(|window| (window[1] - window[0]).abs())
             .collect();
 
-        Some(
-            differences.iter().sum::<f64>() / differences.len() as f64
-        )
+        Some(differences.iter().sum::<f64>() / differences.len() as f64)
     } else {
         None
     };
@@ -1052,52 +1205,118 @@ async fn reverse_dns_lookup(ip_address: String) -> Result<ReverseDnsResult, Stri
 
 #[tauri::command]
 fn traceroute_host(target: String) -> Result<Vec<TracerouteHop>, String> {
+    #[cfg(target_os = "windows")]
+    let output = std::process::Command::new("tracert")
+        .args(["-d", "-h", "20", "-w", "2000", &target])
+        .output()
+        .map_err(|error| format!("Impossible de lancer tracert : {error}"))?;
+
+    #[cfg(not(target_os = "windows"))]
     let output = std::process::Command::new("traceroute")
         .args(["-n", "-m", "20", "-w", "2", &target])
         .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() && output.stdout.is_empty() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
+        .map_err(|error| format!("Impossible de lancer traceroute : {error}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() && stdout.trim().is_empty() {
+        return Err(if stderr.trim().is_empty() {
+            format!("Traceroute a échoué avec le code {}", output.status)
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+
     let mut hops = Vec::new();
 
-    for line in stdout.lines().skip(1) {
-        let mut parts = line.split_whitespace();
+    for line in stdout.lines() {
+        let line = line.trim();
 
-        let Some(hop) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
-            continue;
+        #[cfg(target_os = "windows")]
+        let parsed = {
+            // Format Windows : numéro de saut, latences et adresse IP ou nom d'hôte.
+            let mut parts = line.split_whitespace();
+            let hop = parts.next().and_then(|value| value.parse::<u32>().ok());
+
+            hop.map(|hop| {
+                let remaining: Vec<&str> = parts.collect();
+
+                if remaining.is_empty() || remaining.iter().all(|part| *part == "*") {
+                    return TracerouteHop {
+                        hop,
+                        address: None,
+                        latency_ms: None,
+                    };
+                }
+
+                let latency_ms = remaining.iter().find_map(|part| {
+                    let value = part.trim_end_matches("ms");
+                    value.parse::<f64>().ok()
+                });
+
+                let address = remaining
+                    .iter()
+                    .rev()
+                    .find(|part| {
+                        part.starts_with('[')
+                            || part.starts_with("10.")
+                            || part.starts_with("192.168.")
+                            || part.starts_with("172.")
+                            || part.contains(':')
+                            || part.chars().filter(|character| *character == '.').count() == 3
+                    })
+                    .map(|part| part.trim_matches(&['[', ']'][..]).to_string());
+
+                TracerouteHop {
+                    hop,
+                    address,
+                    latency_ms,
+                }
+            })
         };
 
-        let remaining: Vec<&str> = parts.collect();
+        #[cfg(not(target_os = "windows"))]
+        let parsed = {
+            let mut parts = line.split_whitespace();
 
-        if remaining.is_empty() {
-            continue;
+            parts.next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map(|hop| {
+                    let remaining: Vec<&str> = parts.collect();
+
+                    if remaining.is_empty() || remaining[0] == "*" {
+                        return TracerouteHop {
+                            hop,
+                            address: None,
+                            latency_ms: None,
+                        };
+                    }
+
+                    let address = remaining.first().map(|value| (*value).to_string());
+
+                    let latency_ms = remaining.iter().skip(1).find_map(|value| {
+                        value.trim_end_matches("ms").parse::<f64>().ok()
+                    });
+
+                    TracerouteHop {
+                        hop,
+                        address,
+                        latency_ms,
+                    }
+                })
+        };
+
+        if let Some(hop) = parsed {
+            hops.push(hop);
         }
+    }
 
-        if remaining[0] == "*" {
-            hops.push(TracerouteHop {
-                hop,
-                address: None,
-                latency_ms: None,
-            });
-
-            continue;
-        }
-
-        let address = remaining.first().map(|value| (*value).to_string());
-
-        let latency_ms = remaining
-            .iter()
-            .skip(1)
-            .find_map(|value| value.trim_end_matches("ms").parse::<f64>().ok());
-
-        hops.push(TracerouteHop {
-            hop,
-            address,
-            latency_ms,
+    if hops.is_empty() && !output.status.success() {
+        return Err(if stderr.trim().is_empty() {
+            "Traceroute n'a retourné aucun saut réseau.".to_string()
+        } else {
+            stderr.trim().to_string()
         });
     }
 
@@ -1120,7 +1339,7 @@ fn is_interface_up(name: &str) -> bool {
         name.replace('\'', "''")
     );
 
-    let output = Command::new("powershell")
+    let output = hidden_powershell_command()
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1165,8 +1384,7 @@ fn get_interface_states() -> BTreeMap<String, bool> {
 
     let _refresh_guard = match refresh_lock.lock() {
         Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("[NetToolBox] Verrou de rafraîchissement indisponible : {error}");
+        Err(_) => {
             return BTreeMap::new();
         }
     };
@@ -1177,28 +1395,25 @@ fn get_interface_states() -> BTreeMap<String, bool> {
     if let Ok(guard) = cache.lock() {
         if let Some((timestamp, states)) = guard.as_ref() {
             if timestamp.elapsed() < std::time::Duration::from_secs(10) {
-                eprintln!("[NetToolBox] Cache utilisé : états des interfaces");
                 return states.clone();
-            } else {
-                eprintln!("[NetToolBox] Cache expiré : nouvel appel PowerShell");
             }
         }
     }
-    use std::process::Command;
 
-    let script = "Get-NetAdapter | Select-Object -Property Name, Status | ConvertTo-Json -Compress";
+    let script =
+        "Get-NetAdapter | Select-Object -Property Name, Status | ConvertTo-Json -Compress";
 
-    let output = Command::new("powershell")
+    let output = match hidden_powershell_command()
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             script,
         ])
-        .output();
-
-    let Ok(output) = output else {
-        return BTreeMap::new();
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return BTreeMap::new(),
     };
 
     if !output.status.success() {
@@ -1207,8 +1422,9 @@ fn get_interface_states() -> BTreeMap<String, bool> {
 
     let text = String::from_utf8_lossy(&output.stdout);
 
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return BTreeMap::new();
+    let value = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => value,
+        Err(_) => return BTreeMap::new(),
     };
 
     let mut states = BTreeMap::new();
@@ -1220,23 +1436,25 @@ fn get_interface_states() -> BTreeMap<String, bool> {
     };
 
     for adapter in adapters {
-        let Some(name) = adapter.get("Name").and_then(|v| v.as_str()) else {
+        let Some(name) = adapter.get("Name").and_then(|value| value.as_str()) else {
             continue;
         };
 
         let is_up = adapter
             .get("Status")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
             .is_some_and(|status| status == "Up");
 
         states.insert(name.to_string(), is_up);
     }
 
+    eprintln!(
+        "[Network Discovery] États des interfaces récupérés : {:?}",
+        states
+    );
+
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((std::time::Instant::now(), states.clone()));
-        eprintln!("[NetToolBox] Cache des interfaces mis à jour");
-    } else {
-        eprintln!("[NetToolBox] Impossible de verrouiller le cache");
     }
 
     states
@@ -1253,7 +1471,6 @@ fn parse_wifi_bitrate(value: &str) -> Option<f64> {
 #[tauri::command]
 async fn refresh_interface_states() -> Result<(), String> {
     let start = std::time::Instant::now();
-    eprintln!("[NetToolBox] Début refresh_interface_states");
 
     tokio::task::spawn_blocking(|| {
         get_interface_states();
@@ -1261,69 +1478,34 @@ async fn refresh_interface_states() -> Result<(), String> {
     .await
     .map_err(|error| error.to_string())?;
 
-    eprintln!(
-        "[NetToolBox] Fin refresh_interface_states : {:?}",
-        start.elapsed()
-    );
-
     Ok(())
 }
 
 #[tauri::command]
 fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
-    eprintln!("[NetToolBox] Début network_interfaces");
     let debug_start = std::time::Instant::now();
 
 #[cfg(target_os = "windows")]
-let interface_states = get_cached_interface_states().unwrap_or_default();
+let interface_states = get_cached_interface_states()
+    .unwrap_or_else(get_interface_states);
 
 let if_addrs_start = std::time::Instant::now();
 let interfaces = if_addrs::get_if_addrs().map_err(|error| {
-    eprintln!("[NetToolBox] Erreur if_addrs : {error}");
     error.to_string()
 })?;
-
-eprintln!(
-    "[NetToolBox] Durée if_addrs::get_if_addrs : {:?}",
-    if_addrs_start.elapsed()
-);
-
-eprintln!(
-    "[NetToolBox] Interfaces détectées : {}",
-    interfaces.len()
-);
 
     let mut interfaces_by_name = BTreeMap::<String, NetworkInterfaceInfo>::new();
 
     for interface in interfaces {
-        eprintln!(
-            "[NetToolBox] Traitement interface : {}",
-            interface.name
-        );
         let is_loopback = interface.is_loopback();
 
-
-        eprintln!(
-            "[NetToolBox] Préparation des informations : {}",
-            interface.name
-        );
         let entry = interfaces_by_name
             .entry(interface.name.clone())
             .or_insert_with(|| {
 
-            eprintln!(
-                "[NetToolBox] Début commande iw : {}",
-                interface.name
-            );
-
             let wifi_output = std::process::Command::new("iw")
                 .args(["dev", &interface.name, "link"])
                 .output();
-
-            eprintln!(
-                "[NetToolBox] Fin commande iw : {}",
-                interface.name
-            );
 
             let wifi_info = wifi_output
                 .ok()
@@ -1387,19 +1569,10 @@ eprintln!(
                 }
 
                 if entry.ipv6_addresses.is_empty() {
-                    eprintln!(
-                        "[NetToolBox] Début commande IPv6 : {}",
-                        interface.name
-                    );
 
                     let ipv6_result = std::process::Command::new("ip")
                         .args(["-6", "addr", "show", "dev", &interface.name])
                         .output();
-
-                    eprintln!(
-                        "[NetToolBox] Fin commande IPv6 : {}",
-                        interface.name
-                    );
 
                     let ipv6_output = ipv6_result
                         .ok()
@@ -1434,15 +1607,6 @@ eprintln!(
                     }
                 }
     }
-    eprintln!(
-        "[NetToolBox] Fin du traitement. Interfaces regroupées : {}",
-        interfaces_by_name.len()
-    );
-
-    eprintln!(
-        "[NetToolBox] Durée totale network_interfaces : {:?}",
-        debug_start.elapsed()
-        );
 
     Ok(interfaces_by_name.into_values().collect())
 }
@@ -1555,7 +1719,7 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
     "#;
 
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("powershell")
+        hidden_powershell_command()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
     })
@@ -1603,11 +1767,6 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
             metric: entry["RouteMetric"].as_u64().map(|value| value as u32),
         });
     }
-
-    eprintln!(
-        "[NetToolBox] network_routes terminé en {:?}",
-        start.elapsed()
-    );
 
     Ok(routes)
 }
@@ -1777,7 +1936,7 @@ async fn route_lookup(target: String) -> Result<RouteLookupResult, String> {
         target_ip
     );
 
-    let output = std::process::Command::new("powershell")
+    let output = hidden_powershell_command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|error| format!("Impossible de rechercher la route : {error}"))?;
@@ -2074,7 +2233,7 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
     "#;
 
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("powershell")
+        hidden_powershell_command()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
     })
@@ -2120,11 +2279,6 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
         });
     }
 
-    eprintln!(
-        "[NetToolBox] network_neighbors terminé en {:?}",
-        start.elapsed()
-    );
-
     Ok(neighbors)
 }
 
@@ -2132,64 +2286,124 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
 async fn network_discovery(
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<NetworkDiscoveryDevice>, String> {
+    eprintln!("[Network Discovery] Commande Rust appelée");
     let interfaces = network_interfaces()?;
+    eprintln!(
+        "[Network Discovery] Interfaces détectées : {}",
+        interfaces.len()
+    );
 
-    let local_interface = interfaces
+    eprintln!("[Network Discovery] Interfaces disponibles :");
+
+    for interface in &interfaces {
+        eprintln!(
+            "[Network Discovery] Interface : {} | active={} | loopback={} | IPv4={:?}",
+            interface.name,
+            interface.is_up,
+            interface.is_loopback,
+            interface.ipv4_addresses
+        );
+    }
+
+    let routes = network_routes().await?;
+
+    eprintln!(
+        "[Network Discovery] Routes détectées : {}",
+        routes.len()
+    );
+
+    // Rechercher les interfaces actives disposant d'une IPv4
+    // et d'une route connectée correspondant à leur sous-réseau.
+    let mut candidates = interfaces
         .iter()
-        .find(|interface| {
+        .filter(|interface| {
             interface.is_up
                 && !interface.is_loopback
                 && interface
                     .ipv4_addresses
                     .iter()
-                    .any(|address| address != "127.0.0.1")
+                    .any(|address| address.parse::<Ipv4Addr>().is_ok())
         })
-        .ok_or_else(|| "No active IPv4 network interface found".to_string())?;
+        .filter_map(|interface| {
+            let local_ipv4 = interface
+                .ipv4_addresses
+                .iter()
+                .find_map(|address| address.parse::<Ipv4Addr>().ok())?;
 
-    let local_ipv4 = local_interface
-        .ipv4_addresses
+            let local_ipv4_u32 = u32::from(local_ipv4);
+
+            let connected_route = routes
+                .iter()
+                .filter(|route| {
+                    route.interface_name.as_deref() == Some(interface.name.as_str())
+                        && route.destination.contains('/')
+                        && route.gateway.is_none()
+                })
+                .filter_map(|route| {
+                    let (address, prefix) = route.destination.split_once('/')?;
+                    let network = address.parse::<Ipv4Addr>().ok()?;
+                    let prefix_length = prefix.parse::<u32>().ok()?;
+
+                    if !(1..=30).contains(&prefix_length) {
+                        return None;
+                    }
+
+                    let mask = u32::MAX << (32 - prefix_length);
+                    let network_u32 = u32::from(network);
+
+                    if (local_ipv4_u32 & mask) != (network_u32 & mask) {
+                        return None;
+                    }
+
+                    Some((route, prefix_length))
+                })
+                .max_by_key(|(_, prefix_length)| *prefix_length)?;
+
+            Some((interface, local_ipv4, connected_route.0))
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Err(
+            "No suitable connected IPv4 subnet found for network discovery".to_string()
+        );
+    }
+
+    // Identifier l'interface associée à la route IPv4 par défaut.
+    let default_route_interface = routes
         .iter()
-        .find_map(|address| address.parse::<Ipv4Addr>().ok())
-        .ok_or_else(|| "No valid local IPv4 address found".to_string())?;
+        .find(|route| {
+            route.destination == "0.0.0.0/0"
+                || route.destination == "0.0.0.0/0.0.0.0"
+        })
+        .and_then(|route| route.interface_name.as_deref());
 
-    let routes = network_routes().await?;
+    // Privilégier cette interface si elle dispose d'un sous-réseau
+    // directement connecté ; sinon utiliser la première candidate.
+    let selected_index = default_route_interface
+        .and_then(|name| {
+            candidates
+                .iter()
+                .position(|(interface, _, _)| interface.name == name)
+        })
+        .unwrap_or(0);
+
+    let (local_interface, local_ipv4, local_route) =
+        candidates.swap_remove(selected_index);
 
     let local_ipv4_u32 = u32::from(local_ipv4);
 
-    let local_route = routes
-        .iter()
-        .find(|route| {
-            route.interface_name.as_deref() == Some(&local_interface.name)
-                && route.destination.contains('/')
-                && route.gateway.is_none()
-                && route
-                    .destination
-                    .split_once('/')
-                    .and_then(|(address, _)| address.parse::<Ipv4Addr>().ok())
-                    .map(|network| {
-                        let network_u32 = u32::from(network);
+    eprintln!(
+        "[Network Discovery] Interface sélectionnée : {} ({})",
+        local_interface.name,
+        local_ipv4
+    );
 
-                        let prefix_length = route
-                            .destination
-                            .split_once('/')
-                            .and_then(|(_, prefix)| prefix.parse::<u32>().ok())
-                            .unwrap_or(32);
-
-                        if prefix_length == 0 {
-                            true
-                        } else {
-                            let mask = u32::MAX << (32 - prefix_length);
-                            (local_ipv4_u32 & mask) == (network_u32 & mask)
-                        }
-                    })
-                    .unwrap_or(false)
-        })
-        .ok_or_else(|| {
-            format!(
-                "No connected IPv4 route found for interface {}",
-                local_interface.name
-            )
-        })?;
+    eprintln!(
+        "[Network Discovery] Route locale sélectionnée : {} via interface {}",
+        local_route.destination,
+        local_interface.name
+    );
 
     let (network_address, prefix_length) = local_route
         .destination
@@ -2204,19 +2418,9 @@ async fn network_discovery(
         .parse::<u32>()
         .map_err(|error| error.to_string())?;
 
-    if prefix_length > 30 {
-        return Err(format!(
-            "Network discovery requires a subnet of /30 or larger, got /{prefix_length}"
-        ));
-    }
-
-    let mask = if prefix_length == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix_length)
-    };
-
+    let mask = u32::MAX << (32 - prefix_length);
     let network_u32 = u32::from(network_ip) & mask;
+
     let broadcast_u32 = network_u32 | !mask;
 
     let first_host = network_u32.saturating_add(1);
@@ -2233,6 +2437,10 @@ async fn network_discovery(
     }
 
     let total = targets.len();
+        eprintln!(
+        "[Network Discovery] Cibles à scanner : {}",
+        total
+    );
     let concurrency = 32usize;
     let mut discovered = Vec::new();
     let mut scanned = 0usize;
@@ -2264,6 +2472,13 @@ async fn network_discovery(
                         .args(["-n", "1", "-w", "1000", &address])
                         .output()
                         .ok()?;
+                
+                #[cfg(target_os = "windows")]
+                eprintln!(
+                    "[Network Discovery] ping exit status for {}: {}",
+                    address,
+                    output.status
+                );
 
                 if !output.status.success() {
                     return None;
@@ -2272,14 +2487,34 @@ async fn network_discovery(
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
                 let latency_ms = stdout.lines().find_map(|line| {
-                    line.split("time=")
-                        .nth(1)
-                        .and_then(|value| {
-                            value
-                                .split_whitespace()
-                                .next()
-                                .and_then(|value| value.parse::<f64>().ok())
-                        })
+                    let lower = line.to_lowercase();
+
+                    if let Some(index) = lower.find("time=").or_else(|| lower.find("temps=")) {
+                        let prefix_length = if lower[index..].starts_with("temps=") {
+                            6
+                        } else {
+                            5
+                        };
+
+                        line[index + prefix_length..]
+                            .split_whitespace()
+                            .next()
+                            .and_then(|value| value.trim_end_matches("ms").parse::<f64>().ok())
+                    } else if let Some(index) = lower.find("time<").or_else(|| lower.find("temps<")) {
+                        let prefix_length = if lower[index..].starts_with("temps<") {
+                            6
+                        } else {
+                            5
+                        };
+
+                        line[index + prefix_length..]
+                            .split_whitespace()
+                            .next()
+                            .and_then(|value| value.trim_end_matches("ms").parse::<f64>().ok())
+                            .map(|value| value / 2.0)
+                    } else {
+                        None
+                    }
                 });
 
                 Some((address, latency_ms))
@@ -2292,6 +2527,13 @@ async fn network_discovery(
             if let Ok(Some((address, latency_ms))) = handle.await {
                 discovered.push((address, latency_ms));
             }
+
+            eprintln!(
+                "[Network Discovery] Progression : {}/{} — appareils trouvés : {}",
+                scanned,
+                total,
+                discovered.len()
+            );
 
             let _ = app_handle.emit(
                 "network-discovery-progress",
@@ -2306,9 +2548,48 @@ async fn network_discovery(
 
     let neighbors = network_neighbors().await?;
 
-    let mut result = Vec::new();
+    // Conserver les appareils détectés par ping et leur latence.
+    let mut discovered_map = std::collections::HashMap::new();
 
     for (ip_address, latency_ms) in discovered {
+        discovered_map.insert(ip_address, latency_ms);
+    }
+
+    // Ajouter les voisins connus du sous-réseau sélectionné,
+    // même s'ils ne répondent pas au ping.
+    for neighbor in &neighbors {
+        let Ok(neighbor_ip) = neighbor.ip_address.parse::<Ipv4Addr>() else {
+            continue;
+        };
+
+        let neighbor_ip_u32 = u32::from(neighbor_ip);
+
+        // Ignorer l'adresse locale et les adresses hors du sous-réseau.
+        if neighbor_ip_u32 == local_ipv4_u32
+            || (neighbor_ip_u32 & mask) != network_u32
+        {
+            continue;
+        }
+
+        // Ne pas ajouter les entrées sans adresse MAC qui sont
+        // incomplètes ou en échec.
+        let state = neighbor.state.to_lowercase();
+        if neighbor.mac_address.is_none()
+            && (state.contains("incomplete")
+                || state.contains("failed")
+                || state.contains("unreachable"))
+        {
+            continue;
+        }
+
+        discovered_map
+            .entry(neighbor.ip_address.clone())
+            .or_insert(None);
+    }
+
+    let mut result = Vec::new();
+
+    for (ip_address, latency_ms) in discovered_map {
         let neighbor = neighbors
             .iter()
             .find(|neighbor| neighbor.ip_address == ip_address);
@@ -2431,7 +2712,7 @@ async fn dns_info() -> Result<DnsInfo, String> {
     "#;
 
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("powershell")
+        hidden_powershell_command()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
     })
@@ -2484,11 +2765,6 @@ async fn dns_info() -> Result<DnsInfo, String> {
 
     let current_server = servers.first().cloned();
 
-    eprintln!(
-        "[NetToolBox] dns_info terminé en {:?}",
-        start.elapsed()
-    );
-
     Ok(DnsInfo {
         interface_name,
         current_server,
@@ -2521,16 +2797,11 @@ let cache = NET_TOOLBOX_INITIAL_DATA_CACHE
 if let Ok(guard) = cache.lock() {
     if let Some((timestamp, data)) = guard.as_ref() {
         if timestamp.elapsed() < std::time::Duration::from_secs(5) {
-            eprintln!(
-                "[NetToolBox] Cache des données initiales utilisé : {:?}",
-                timestamp.elapsed()
-            );
+
             return Ok(data.clone());
         }
     }
 }
-
-eprintln!("[NetToolBox] >>> Collecte initiale des données réseau");
 
     let script = r#"
     $ErrorActionPreference = 'Stop'
@@ -2577,34 +2848,13 @@ eprintln!("[NetToolBox] >>> Collecte initiale des données réseau");
     "#;
 
     let output = tokio::task::spawn_blocking(move || {
-        eprintln!("[NetToolBox] Lancement du processus PowerShell groupé");
-        std::process::Command::new("powershell")
+        hidden_powershell_command()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
     })
     .await
     .map_err(|error| format!("Échec de la tâche réseau initiale : {error}"))?
     .map_err(|error| format!("Impossible de récupérer les données réseau : {error}"))?;
-
-    eprintln!(
-        "[NetToolBox] PowerShell terminé : succès={}, code={:?}, stdout={} octets, stderr={} octets",
-        output.status.success(),
-        output.status.code(),
-        output.stdout.len(),
-        output.stderr.len()
-    );
-
-    if !output.stderr.is_empty() {
-        eprintln!(
-            "[NetToolBox] Mesures PowerShell :\n{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    eprintln!(
-        "[NetToolBox] Sortie PowerShell UTF-8 valide : {}",
-        std::str::from_utf8(&output.stdout).is_ok()
-    );
 
     if !output.status.success() {
         return Err(format!(
@@ -2615,13 +2865,6 @@ eprintln!("[NetToolBox] >>> Collecte initiale des données réseau");
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Réponse réseau JSON invalide : {error}"))?;
-
-    eprintln!("[NetToolBox] JSON analysé correctement");
-    eprintln!(
-        "[NetToolBox] Clés JSON reçues : {:?}",
-        json.as_object()
-            .map(|object| object.keys().collect::<Vec<_>>())
-    );
 
     let as_array = |value: &serde_json::Value| -> Vec<serde_json::Value> {
         match value {
@@ -2729,13 +2972,6 @@ eprintln!("[NetToolBox] >>> Collecte initiale des données réseau");
         }
     }
 
-    eprintln!("[NetToolBox] États des adaptateurs reçus : {:?}", interface_states);
-
-    eprintln!(
-        "[NetToolBox] Nombre d'adaptateurs analysés : {}",
-        interface_states.len()
-    );
-
         let interface_cache = INTERFACE_STATES_CACHE
         .get_or_init(|| std::sync::Mutex::new(None));
 
@@ -2755,11 +2991,6 @@ eprintln!("[NetToolBox] >>> Collecte initiale des données réseau");
     if let Ok(mut guard) = initial_data_cache.lock() {
         *guard = Some((std::time::Instant::now(), data.clone()));
     }
-
-    eprintln!(
-        "[NetToolBox] Chargement réseau groupé terminé : {:?}",
-        start.elapsed()
-    );
 
     Ok(data)
 }
@@ -5039,7 +5270,13 @@ async fn open_ssh_shell(
 
     let address = format!("{}:{}", config.host, config.port);
 
-    let mut handle = match russh::client::connect(ssh_config, address, handler).await {
+    let mut handle = match russh::client::connect(
+        ssh_config,
+        address,
+        handler,
+    )
+    .await
+    {
         Ok(handle) => handle,
         Err(error) => {
             let presented_fingerprint = presented_host_key_fingerprint
@@ -5339,7 +5576,20 @@ async fn ssh_connect(
     server_id: String,
     passphrase: Option<String>,
 ) -> Result<String, String> {
+    let command_started = std::time::Instant::now();
+
     let connection = init_database(&app_handle)?;
+
+    let connection_timeout_secs = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params!["connection_timeout"],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=300).contains(value))
+        .unwrap_or(15);
 
     let server = connection
         .query_row(
@@ -5386,13 +5636,27 @@ async fn ssh_connect(
         None
     };
 
-    let channel = open_ssh_shell(
-        &config,
-        server.host_key_fingerprint.clone(),
-        password,
-        passphrase,
+    let ssh_connect_started = std::time::Instant::now();
+
+    let channel = match tokio::time::timeout(
+        Duration::from_secs(connection_timeout_secs),
+        open_ssh_shell(
+            &config,
+            server.host_key_fingerprint.clone(),
+            password,
+            passphrase,
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            return Err(format!(
+                "SSH connection timed out after {connection_timeout_secs} seconds"
+            ));
+        }
+    };
 
     let (mut reader, writer) = channel.split();
 
@@ -5633,14 +5897,29 @@ async fn ssh_test_connection(
         None
     };
 
-    match connect_ssh_server(
-        &config,
-        expected_host_key_fingerprint,
-        password,
+    let connection_timeout_secs = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params!["connection_timeout"],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=300).contains(value))
+        .unwrap_or(15);
+
+    let connection_result = tokio::time::timeout(
+        Duration::from_secs(connection_timeout_secs),
+        connect_ssh_server(
+            &config,
+            expected_host_key_fingerprint,
+            password,
+        ),
     )
-    .await
-    {
-        Ok(()) => {
+    .await;
+
+    match connection_result {
+        Ok(Ok(())) => {
             let status = "connected";
             let message = "SSH connection successful";
 
@@ -5658,7 +5937,9 @@ async fn ssh_test_connection(
             })
         }
 
-        Err(error) if error.starts_with("SSH host key not trusted yet: ") => {
+        Ok(Err(error))
+            if error.starts_with("SSH host key not trusted yet: ") =>
+        {
             let fingerprint = error
                 .strip_prefix("SSH host key not trusted yet: ")
                 .map(str::to_string);
@@ -5680,7 +5961,9 @@ async fn ssh_test_connection(
             })
         }
 
-        Err(error) if error.starts_with("SSH host key mismatch: ") => {
+        Ok(Err(error))
+            if error.starts_with("SSH host key mismatch: ") =>
+        {
             let fingerprint = error
                 .strip_prefix("SSH host key mismatch: ")
                 .map(str::to_string);
@@ -5702,19 +5985,36 @@ async fn ssh_test_connection(
             })
         }
 
-        Err(error) => {
-            let status = "error";
-
+        Ok(Err(error)) => {
             record_ssh_connection_history(
                 &connection,
                 &server,
-                status,
+                "error",
                 &error,
             )?;
 
             Ok(SshTestConnectionResult {
-                status: status.to_string(),
+                status: "error".to_string(),
                 message: error,
+                host_key_fingerprint: None,
+            })
+        }
+
+        Err(_) => {
+            let message = format!(
+                "SSH connection timed out after {connection_timeout_secs} seconds"
+            );
+
+            record_ssh_connection_history(
+                &connection,
+                &server,
+                "error",
+                &message,
+            )?;
+
+            Ok(SshTestConnectionResult {
+                status: "error".to_string(),
+                message,
                 host_key_fingerprint: None,
             })
         }
@@ -5934,15 +6234,15 @@ fn save_app_setting(
 }
 
 #[tauri::command]
-fn ssh_agent_available() -> Result<bool, String> {
-    use crate::ssh_auth::{
-        SshAgentProvider,
-        SshAuthenticationProvider,
-    };
+async fn ssh_agent_available() -> Result<bool, String> {
+    use crate::ssh_auth::SshAgentProvider;
 
     let provider = SshAgentProvider::new();
 
-    provider.is_available()
+    match provider.connect().await {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

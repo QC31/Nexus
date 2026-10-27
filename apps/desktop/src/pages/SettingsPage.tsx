@@ -106,32 +106,32 @@ export function SettingsPage() {
     };
   }, []);
 
-  async function saveSetting(key: string, value: string) {
-    setIsSaving(true);
-    setMessage("");
-    setError("");
+async function saveSetting(key: string, value: string) {
+  setIsSaving(true);
+  setMessage("");
+  setError("");
 
-    try {
-      await invoke("save_app_setting", { key, value });
+  try {
+    await invoke("save_app_setting", { key, value });
 
-      setSettings((current) => ({
-        ...current,
-        [key]: value,
-      }));
+    setSettings((current) => ({
+      ...current,
+      [key]: value,
+    }));
+    setMessage("Settings saved successfully.");
+  } catch (saveError) {
 
-      setMessage("Settings saved successfully.");
-    } catch (saveError) {
-      setError(
-        `Failed to save setting: ${
-          saveError instanceof Error
-            ? saveError.message
-            : String(saveError)
-        }`,
-      );
-    } finally {
-      setIsSaving(false);
-    }
+    setError(
+      `Failed to save setting: ${
+        saveError instanceof Error
+          ? saveError.message
+          : String(saveError)
+      }`,
+    );
+  } finally {
+    setIsSaving(false);
   }
+}
 
   async function updateSetting(key: string, value: string) {
     await saveSetting(key, value);
@@ -209,29 +209,6 @@ export function SettingsPage() {
 
           <Card>
             <p className="text-xs tracking-wider text-[#9D8589]">NETWORK</p>
-
-            <div className="mt-4 flex items-center justify-between border-b border-[#3B171D] pb-4">
-              <div>
-                <p className="text-sm">NEXUS Agent</p>
-                <p className="mt-1 text-xs text-[#9D8589]">
-                  Local SSH authentication agent availability
-                </p>
-              </div>
-
-              <span
-                className={`font-mono text-xs ${
-                  agentAvailable
-                    ? "text-emerald-400"
-                    : "text-[#C89A65]"
-                }`}
-              >
-                {agentAvailable === null
-                  ? "UNKNOWN"
-                  : agentAvailable
-                    ? "AVAILABLE"
-                    : "UNAVAILABLE"}
-              </span>
-            </div>
 
             <div className="grid gap-4 pt-4 sm:grid-cols-2">
               <label className="block">

@@ -463,7 +463,6 @@ return () => {
 cancelled = true;
 window.clearInterval(interfacesInterval);
 
-
 if (interfaceStatesInterval !== undefined) {
   window.clearInterval(interfaceStatesInterval);
 }

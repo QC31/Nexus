@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { open, save } from '@tauri-apps/plugin-dialog';
+import { confirm, open, save } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type {
@@ -79,7 +79,56 @@ const INITIAL_SERVERS: SshServer[] = [
 ];
 
 export default function SshManagerPage() {
+
   const [servers, setServers] = useState<SshServer[]>([]);
+  const [defaultSshPort, setDefaultSshPort] = useState('22');
+  const [confirmBeforeClosingSessions, setConfirmBeforeClosingSessions] =
+    useState(true);
+  
+  const [confirmSensitiveActions, setConfirmSensitiveActions] =
+    useState(true);
+
+useEffect(() => {
+  let cancelled = false;
+
+  const loadAppSettings = async () => {
+    try {
+      const settings = await invoke<Record<string, string>>('get_app_settings');
+
+      if (cancelled) {
+        return;
+      }
+
+      const configuredPort = Number(settings.default_ssh_port);
+
+      if (
+        Number.isInteger(configuredPort) &&
+        configuredPort >= 1 &&
+        configuredPort <= 65535
+      ) {
+        setDefaultSshPort(String(configuredPort));
+      }
+
+      setConfirmBeforeClosingSessions(
+        settings.confirm_before_closing_sessions !== 'false',
+      );
+
+      setConfirmSensitiveActions(
+        settings.confirm_sensitive_actions !== 'false',
+      );
+
+    } catch (loadError) {
+      console.error('Failed to load app settings:', loadError);
+    }
+  };
+
+  void loadAppSettings();
+
+  return () => {
+    cancelled = true;
+  };
+}, []);
+
   const [connectionHistory, setConnectionHistory] = useState<
     SshConnectionHistoryRecord[]
   >([]);
@@ -355,7 +404,7 @@ useEffect(() => {
   let unlistenClosed: (() => void) | undefined;
 
   const subscribeToSshEvents = async () => {
-    try {
+    try {      
       const existingOutput = await invoke<string>('ssh_get_output', {
         sessionId: sshSessionId,
       });
@@ -483,7 +532,7 @@ const isServerConnected = (serverId: string) =>
     setName('');
     setHost('');
     setUsername('');
-    setPort('22');
+    setPort(defaultSshPort);
     setAuthenticationMethod('ssh-agent');
     setPrivateKeyPath('');
     setPassword('');
@@ -657,28 +706,44 @@ resetForm();
   }
 };
 
-  const handleDeleteServer = async () => {
-    if (!selectedServer) {
-      return;
-    }
+const handleDeleteServer = async () => {
+  if (!selectedServer) {
+    return;
+  }
 
-    try {
-      setError('');
+  try {
+    setError('');
 
-      await invoke('delete_ssh_server', {
-        serverId: selectedServer.id,
-      });
-
-      setServers((currentServers) =>
-        currentServers.filter((server) => server.id !== selectedServer.id),
+    if (confirmSensitiveActions) {
+      const confirmed = await confirm(
+        `Are you sure you want to delete the SSH server "${selectedServer.name}"? This action cannot be undone.`,
+        {
+          title: 'Confirm server deletion',
+          kind: 'warning',
+          okLabel: 'Delete',
+          cancelLabel: 'Cancel',
+        },
       );
 
-      setSelectedServerId(null);
-    } catch (error) {
-      console.error('Failed to delete SSH server:', error);
-      setError(String(error));
+      if (!confirmed) {
+        return;
+      }
     }
-  };
+
+    await invoke('delete_ssh_server', {
+      serverId: selectedServer.id,
+    });
+
+    setServers((currentServers) =>
+      currentServers.filter((server) => server.id !== selectedServer.id),
+    );
+
+    setSelectedServerId(null);
+  } catch (error) {
+    console.error('Failed to delete SSH server:', error);
+    setError(String(error));
+  }
+};
 
 const handleConnect = async () => {
   if (!selectedServer) {
@@ -693,6 +758,13 @@ const handleConnect = async () => {
     }>('ssh_test_connection', {
       serverId: selectedServer.id,
     });
+
+    if (
+      result.status === 'error' ||
+      result.status === 'host-key-mismatch'
+    ) {
+      throw new Error(result.message);
+    }
 
     if (
       result.status === 'host-key-required' &&
@@ -744,13 +816,16 @@ const handleConnect = async () => {
       }
     }
 
-    const sessionId = await invoke<string>(
-      'ssh_connect',
-      {
-        serverId: selectedServer.id,
-        passphrase,
-      },
-    );
+  const sessionId = await invoke<string>(
+    'ssh_connect',
+    {
+      serverId: selectedServer.id,
+      passphrase,
+    },
+  ).catch((error) => {
+
+    throw error;
+  });
 
     const tabId = crypto.randomUUID();
 
@@ -770,17 +845,15 @@ const handleConnect = async () => {
     setSshSessionId(sessionId);
     setSshOutput('');
 
-    window.alert(
-      `SSH session connected.\n\nSession ID:\n${sessionId}`,
-    );
-  } catch (error) {
-    window.alert(
-      `SSH connection failed:\n\n${String(error)}`,
-    );
-  }
+    } catch (error) {
+        window.alert(
+          `SSH connection failed:\n\n${String(error)}`,
+        );
+      }
 };
 
 const closeSshSession = async (sessionId: string) => {
+
   const closingTab = sshSessionTabs.find(
     (tab) => tab.sessionId === sessionId,
   );
@@ -788,6 +861,33 @@ const closeSshSession = async (sessionId: string) => {
   if (!closingTab) {
     return;
   }
+
+  if (confirmBeforeClosingSessions) {
+  let confirmed: boolean;
+
+  try {
+    confirmed = await confirm(
+      `Disconnect the SSH session "${closingTab.serverName}"?`,
+      {
+        title: 'Confirm SSH disconnection',
+        kind: 'warning',
+        okLabel: 'Disconnect',
+        cancelLabel: 'Cancel',
+      },
+    );
+
+  } catch (error) {
+    console.error('SSH confirmation dialog failed:', error);
+    window.alert(
+      `Unable to open the SSH confirmation dialog:\n\n${String(error)}`,
+    );
+    return;
+  }
+
+  if (!confirmed) {
+    return;
+  }
+}
 
   try {
     await invoke('ssh_disconnect', {
@@ -1528,9 +1628,10 @@ const sftpPathSegments =
                 <button
                   type="button"
                   onClick={() => {
-                    setError('');
+                    setEditingServerId(null);
+                    resetForm();
                     setIsAddingServer(true);
-                  }}
+                    }}
                   className="rounded-md border border-[#542028] bg-[#1D0D11] px-3 py-2 text-xs font-medium tracking-[0.12em] text-[#EEE5E6] transition hover:border-[#8F1826] hover:bg-[#261015]"
                 >
                   + ADD
