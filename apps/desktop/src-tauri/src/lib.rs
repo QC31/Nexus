@@ -1931,6 +1931,7 @@ async fn route_lookup(target: String) -> Result<RouteLookupResult, String> {
 
     let script = format!(
         "Find-NetRoute -RemoteIPAddress '{}' | \
+         Where-Object {{ $_.CimClass.CimClassName -eq 'MSFT_NetRoute' }} | \
          Select-Object -First 1 DestinationPrefix, NextHop, InterfaceAlias, RouteMetric | \
          ConvertTo-Json -Compress",
         target_ip
