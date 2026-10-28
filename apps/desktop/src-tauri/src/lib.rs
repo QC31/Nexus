@@ -33,15 +33,19 @@ fn hidden_powershell_command() -> std::process::Command {
 }
 
 fn hidden_command(program: &str) -> std::process::Command {
-    let mut command = std::process::Command::new(program);
-
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+
+        let mut command = std::process::Command::new(program);
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command
     }
 
-    command
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new(program)
+    }
 }
 
 #[derive(Debug, Serialize)]
