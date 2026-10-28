@@ -32,6 +32,18 @@ fn hidden_powershell_command() -> std::process::Command {
     command
 }
 
+fn hidden_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    command
+}
+
 #[derive(Debug, Serialize)]
 struct Ipv6AddressInfo {
     address: String,
@@ -541,7 +553,7 @@ async fn http_diagnostic(url: String) -> Result<HttpDiagnosticResult, String> {
 fn ping_host(target: String) -> Result<PingResult, String> {
     #[cfg(target_os = "windows")]
     let output = {
-        let mut command = std::process::Command::new("ping");
+        let mut command = hidden_command("ping");
         command
             .args(["-n", "4", "-w", "2000", &target])
             .env("LANG", "en_US.UTF-8")
@@ -553,7 +565,7 @@ fn ping_host(target: String) -> Result<PingResult, String> {
     };
 
     #[cfg(not(target_os = "windows"))]
-    let output = std::process::Command::new("ping")
+    let output = hidden_command("ping")
         .args(["-c", "4", "-W", "2", &target])
         .output()
         .map_err(|error| format!("Impossible de lancer Ping : {error}"))?;
@@ -1206,13 +1218,13 @@ async fn reverse_dns_lookup(ip_address: String) -> Result<ReverseDnsResult, Stri
 #[tauri::command]
 fn traceroute_host(target: String) -> Result<Vec<TracerouteHop>, String> {
     #[cfg(target_os = "windows")]
-    let output = std::process::Command::new("tracert")
+    let output = hidden_command("tracert")
         .args(["-d", "-h", "20", "-w", "2000", &target])
         .output()
         .map_err(|error| format!("Impossible de lancer tracert : {error}"))?;
 
     #[cfg(not(target_os = "windows"))]
-    let output = std::process::Command::new("traceroute")
+    let output = hidden_command("traceroute")
         .args(["-n", "-m", "20", "-w", "2", &target])
         .output()
         .map_err(|error| format!("Impossible de lancer traceroute : {error}"))?;
@@ -2401,13 +2413,13 @@ async fn network_discovery(
 
             handles.push(tokio::task::spawn_blocking(move || {
                 #[cfg(target_os = "linux")]
-                    let output = std::process::Command::new("ping")
+                    let output = hidden_command("ping")
                         .args(["-c", "1", "-W", "1", &address])
                         .output()
                         .ok()?;
 
                     #[cfg(target_os = "windows")]
-                    let output = std::process::Command::new("ping")
+                    let output = hidden_command("ping")
                         .args(["-n", "1", "-w", "1000", &address])
                         .output()
                         .ok()?;
