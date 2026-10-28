@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "nexus",
+  "productName": "Nexus",
   "version": "0.1.0",
-  "identifier": "com.quentin.nexus",
+  "identifier": "com.kayrozn.nexus",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "nexus",
+        "title": "Nexus",
         "width": 800,
         "height": 600
       }
@@ -24,6 +24,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Kayrozn",
+    "copyright": "Copyright © 2026 Kayrozn",
+    "shortDescription": "Nexus - Network Operations Suite",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
