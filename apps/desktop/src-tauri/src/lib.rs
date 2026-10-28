@@ -751,12 +751,12 @@ fn ping_host(target: String) -> Result<PingResult, String> {
     }
 
     if !output.status.success() && received == 0 {
-        // Un hôte injoignable reste un résultat valide : 100 % de pertes.
+        // An unreachable host remains a valid result: 100% losses.
         packet_loss = 100.0;
     }
 
     if !output.status.success() && received > 0 {
-        // Certaines réponses peuvent avoir été reçues malgré un code de sortie non nul.
+        // Some responses may have been received despite a non-zero exit code.
         packet_loss = ((sent.saturating_sub(received)) as f64 / sent.max(1) as f64) * 100.0;
     }
 
@@ -1235,7 +1235,7 @@ fn traceroute_host(target: String) -> Result<Vec<TracerouteHop>, String> {
 
         #[cfg(target_os = "windows")]
         let parsed = {
-            // Format Windows : numéro de saut, latences et adresse IP ou nom d'hôte.
+            // Windows format: jump number, latencies, and IP address or hostname.
             let mut parts = line.split_whitespace();
             let hop = parts.next().and_then(|value| value.parse::<u32>().ok());
 
@@ -1331,32 +1331,6 @@ fn is_interface_up(name: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn is_interface_up(name: &str) -> bool {
-    use std::process::Command;
-
-    let script = format!(
-        "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).Status",
-        name.replace('\'', "''")
-    );
-
-    let output = hidden_powershell_command()
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ])
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim() == "Up"
-        }
-        _ => false,
-    }
-}
-
-#[cfg(target_os = "windows")]
 static INTERFACE_STATES_CACHE: std::sync::OnceLock<
     std::sync::Mutex<Option<(std::time::Instant, BTreeMap<String, bool>)>>,
 > = std::sync::OnceLock::new();
@@ -1448,11 +1422,6 @@ fn get_interface_states() -> BTreeMap<String, bool> {
         states.insert(name.to_string(), is_up);
     }
 
-    eprintln!(
-        "[Network Discovery] États des interfaces récupérés : {:?}",
-        states
-    );
-
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((std::time::Instant::now(), states.clone()));
     }
@@ -1470,7 +1439,6 @@ fn parse_wifi_bitrate(value: &str) -> Option<f64> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn refresh_interface_states() -> Result<(), String> {
-    let start = std::time::Instant::now();
 
     tokio::task::spawn_blocking(|| {
         get_interface_states();
@@ -1483,13 +1451,11 @@ async fn refresh_interface_states() -> Result<(), String> {
 
 #[tauri::command]
 fn network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
-    let debug_start = std::time::Instant::now();
 
 #[cfg(target_os = "windows")]
 let interface_states = get_cached_interface_states()
     .unwrap_or_else(get_interface_states);
 
-let if_addrs_start = std::time::Instant::now();
 let interfaces = if_addrs::get_if_addrs().map_err(|error| {
     error.to_string()
 })?;
@@ -1703,7 +1669,7 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
             interface_name,
             metric,
         });
-    }   
+    }
 
     Ok(result)
 }
@@ -1711,7 +1677,6 @@ async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn network_routes() -> Result<Vec<NetworkRouteInfo>, String> {
-    let start = std::time::Instant::now();
     let script = r#"
         Get-NetRoute |
         Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric |
@@ -2226,7 +2191,6 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
-    let start = std::time::Instant::now();
     let script = r#"
         Get-NetNeighbor |
         Select-Object IPAddress, LinkLayerAddress, InterfaceAlias, State |
@@ -2287,34 +2251,10 @@ async fn network_neighbors() -> Result<Vec<NetworkNeighborInfo>, String> {
 async fn network_discovery(
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<NetworkDiscoveryDevice>, String> {
-    eprintln!("[Network Discovery] Commande Rust appelée");
     let interfaces = network_interfaces()?;
-    eprintln!(
-        "[Network Discovery] Interfaces détectées : {}",
-        interfaces.len()
-    );
-
-    eprintln!("[Network Discovery] Interfaces disponibles :");
-
-    for interface in &interfaces {
-        eprintln!(
-            "[Network Discovery] Interface : {} | active={} | loopback={} | IPv4={:?}",
-            interface.name,
-            interface.is_up,
-            interface.is_loopback,
-            interface.ipv4_addresses
-        );
-    }
-
     let routes = network_routes().await?;
 
-    eprintln!(
-        "[Network Discovery] Routes détectées : {}",
-        routes.len()
-    );
-
-    // Rechercher les interfaces actives disposant d'une IPv4
-    // et d'une route connectée correspondant à leur sous-réseau.
+    // Search for active interfaces with an IPv4 and a connected route corresponding to their subnet.
     let mut candidates = interfaces
         .iter()
         .filter(|interface| {
@@ -2370,7 +2310,7 @@ async fn network_discovery(
         );
     }
 
-    // Identifier l'interface associée à la route IPv4 par défaut.
+    // Identify the interface associated with the default IPv4 route.
     let default_route_interface = routes
         .iter()
         .find(|route| {
@@ -2379,8 +2319,7 @@ async fn network_discovery(
         })
         .and_then(|route| route.interface_name.as_deref());
 
-    // Privilégier cette interface si elle dispose d'un sous-réseau
-    // directement connecté ; sinon utiliser la première candidate.
+    // Favor this interface if it has a directly connected subnet; otherwise use the first candidate.
     let selected_index = default_route_interface
         .and_then(|name| {
             candidates
@@ -2394,18 +2333,6 @@ async fn network_discovery(
 
     let local_ipv4_u32 = u32::from(local_ipv4);
 
-    eprintln!(
-        "[Network Discovery] Interface sélectionnée : {} ({})",
-        local_interface.name,
-        local_ipv4
-    );
-
-    eprintln!(
-        "[Network Discovery] Route locale sélectionnée : {} via interface {}",
-        local_route.destination,
-        local_interface.name
-    );
-
     let (network_address, prefix_length) = local_route
         .destination
         .split_once('/')
@@ -2418,6 +2345,20 @@ async fn network_discovery(
     let prefix_length = prefix_length
         .parse::<u32>()
         .map_err(|error| error.to_string())?;
+
+    if !(1..=30).contains(&prefix_length) {
+        return Err("Network prefix must be between /1 and /30".to_string());
+    }
+
+    let host_count = (1u64 << (32 - prefix_length)) - 2;
+
+    const MAX_DISCOVERY_TARGETS: u64 = 4094;
+
+    if host_count > MAX_DISCOVERY_TARGETS {
+        return Err(format!(
+            "Network is too large for discovery ({host_count} possible hosts). Maximum: {MAX_DISCOVERY_TARGETS}."
+        ));
+    }
 
     let mask = u32::MAX << (32 - prefix_length);
     let network_u32 = u32::from(network_ip) & mask;
@@ -2438,10 +2379,7 @@ async fn network_discovery(
     }
 
     let total = targets.len();
-        eprintln!(
-        "[Network Discovery] Cibles à scanner : {}",
-        total
-    );
+
     let concurrency = 32usize;
     let mut discovered = Vec::new();
     let mut scanned = 0usize;
@@ -2473,13 +2411,8 @@ async fn network_discovery(
                         .args(["-n", "1", "-w", "1000", &address])
                         .output()
                         .ok()?;
-                
+
                 #[cfg(target_os = "windows")]
-                eprintln!(
-                    "[Network Discovery] ping exit status for {}: {}",
-                    address,
-                    output.status
-                );
 
                 if !output.status.success() {
                     return None;
@@ -2529,13 +2462,6 @@ async fn network_discovery(
                 discovered.push((address, latency_ms));
             }
 
-            eprintln!(
-                "[Network Discovery] Progression : {}/{} — appareils trouvés : {}",
-                scanned,
-                total,
-                discovered.len()
-            );
-
             let _ = app_handle.emit(
                 "network-discovery-progress",
                 NetworkDiscoveryProgress {
@@ -2549,15 +2475,14 @@ async fn network_discovery(
 
     let neighbors = network_neighbors().await?;
 
-    // Conserver les appareils détectés par ping et leur latence.
+    // Keep the devices detected by ping and their latency.
     let mut discovered_map = std::collections::HashMap::new();
 
     for (ip_address, latency_ms) in discovered {
         discovered_map.insert(ip_address, latency_ms);
     }
 
-    // Ajouter les voisins connus du sous-réseau sélectionné,
-    // même s'ils ne répondent pas au ping.
+    // Add known neighbors to the selected subnet, even if they are not ping.
     for neighbor in &neighbors {
         let Ok(neighbor_ip) = neighbor.ip_address.parse::<Ipv4Addr>() else {
             continue;
@@ -2565,15 +2490,14 @@ async fn network_discovery(
 
         let neighbor_ip_u32 = u32::from(neighbor_ip);
 
-        // Ignorer l'adresse locale et les adresses hors du sous-réseau.
+        // Ignore local address and addresses outside the subnet.
         if neighbor_ip_u32 == local_ipv4_u32
             || (neighbor_ip_u32 & mask) != network_u32
         {
             continue;
         }
 
-        // Ne pas ajouter les entrées sans adresse MAC qui sont
-        // incomplètes ou en échec.
+        // Do not add entries without a MAC address that are incomplete or failing.
         let state = neighbor.state.to_lowercase();
         if neighbor.mac_address.is_none()
             && (state.contains("incomplete")
@@ -2703,7 +2627,6 @@ fn dns_info() -> Result<DnsInfo, String> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn dns_info() -> Result<DnsInfo, String> {
-    let start = std::time::Instant::now();
 
     let script = r#"
         Get-DnsClientServerAddress |
@@ -2785,7 +2708,6 @@ static NET_TOOLBOX_INITIAL_DATA_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn net_toolbox_initial_data() -> Result<NetToolBoxInitialData, String> {
-    let start = std::time::Instant::now();
 
 let _initial_data_guard = NET_TOOLBOX_INITIAL_DATA_LOCK
     .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -3205,6 +3127,9 @@ fn generate_ssh_key(
     name: String,
     passphrase: Option<String>,
 ) -> Result<SshKeyInfo, String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
     let home_dir = dirs::home_dir()
         .ok_or_else(|| "Unable to determine home directory".to_string())?;
 
@@ -3215,16 +3140,14 @@ fn generate_ssh_key(
 
     let file_name = name.trim();
 
-    if file_name.is_empty() {
-        return Err("Key name cannot be empty".to_string());
-    }
-
-    if file_name.contains('/')
+    if file_name.is_empty()
+        || file_name.contains('/')
         || file_name.contains('\\')
         || file_name == "."
         || file_name == ".."
+        || file_name.contains('\0')
     {
-        return Err("Invalid key name".to_string());
+        return Err("Invalid SSH key name".to_string());
     }
 
     let private_key_path = ssh_dir.join(file_name);
@@ -3254,30 +3177,61 @@ fn generate_ssh_key(
         .to_openssh(ssh_key::LineEnding::LF)
         .map_err(|error| format!("Failed to encode private key: {error}"))?;
 
-    std::fs::write(&private_key_path, private_key_openssh.as_bytes())
-        .map_err(|error| format!("Failed to write private key: {error}"))?;
-
     let public_key = private_key
         .public_key()
         .to_openssh()
         .map_err(|error| format!("Failed to encode public key: {error}"))?;
 
-    std::fs::write(
-        &public_key_path,
-        format!("{public_key}\n").as_bytes(),
-    )
-    .map_err(|error| format!("Failed to write public key: {error}"))?;
+    let mut private_options = OpenOptions::new();
+    private_options.write(true).create_new(true);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(
-            &private_key_path,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .map_err(|error| format!("Failed to secure private key: {error}"))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        private_options.mode(0o600);
     }
+
+    let mut private_file = private_options
+        .open(&private_key_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "SSH key already exists".to_string()
+            } else {
+                format!("Failed to create private key: {error}")
+            }
+        })?;
+
+    if let Err(error) = private_file.write_all(private_key_openssh.as_bytes()) {
+        drop(private_file);
+        let _ = std::fs::remove_file(&private_key_path);
+        return Err(format!("Failed to write private key: {error}"));
+    }
+
+    drop(private_file);
+
+    let mut public_options = OpenOptions::new();
+    public_options.write(true).create_new(true);
+
+    let mut public_file = match public_options.open(&public_key_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&private_key_path);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "SSH public key already exists".to_string()
+            } else {
+                format!("Failed to create public key: {error}")
+            });
+        }
+    };
+
+    if let Err(error) = writeln!(public_file, "{public_key}") {
+        drop(public_file);
+        let _ = std::fs::remove_file(&public_key_path);
+        let _ = std::fs::remove_file(&private_key_path);
+        return Err(format!("Failed to write public key: {error}"));
+    }
+
+    drop(public_file);
 
     let fingerprint = private_key
         .public_key()
@@ -3295,14 +3249,32 @@ fn generate_ssh_key(
 
 #[tauri::command]
 fn delete_ssh_key(path: String) -> Result<(), String> {
+    use std::path::{Component, Path, PathBuf};
+
     let home_dir = dirs::home_dir()
         .ok_or_else(|| "Unable to determine home directory".to_string())?;
 
     let ssh_dir = home_dir.join(".ssh");
 
-    let private_key_path = std::path::PathBuf::from(&path);
+    let private_key_path = PathBuf::from(&path);
 
-    if !private_key_path.starts_with(&ssh_dir) {
+    // Require an absolute path directly inside ~/.ssh.
+    if !private_key_path.is_absolute() {
+        return Err("Invalid SSH key path".to_string());
+    }
+
+    let parent = private_key_path
+        .parent()
+        .ok_or_else(|| "Invalid SSH key path".to_string())?;
+
+    if parent != Path::new(&ssh_dir) {
+        return Err("SSH key must be directly inside ~/.ssh".to_string());
+    }
+
+    // Reject unusual path components and files with extensions.
+    if private_key_path.components().any(|component| {
+        matches!(component, Component::CurDir | Component::ParentDir)
+    }) {
         return Err("Invalid SSH key path".to_string());
     }
 
@@ -3310,26 +3282,50 @@ fn delete_ssh_key(path: String) -> Result<(), String> {
         return Err("Invalid SSH private key path".to_string());
     }
 
-    if !private_key_path.exists() {
-        return Err("SSH private key not found".to_string());
+    let metadata = std::fs::symlink_metadata(&private_key_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "SSH private key not found".to_string()
+            } else {
+                format!("Failed to inspect private key: {error}")
+            }
+        })?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("SSH private key must be a regular file".to_string());
     }
 
-    let public_key_path = private_key_path.with_file_name(
-        format!(
-            "{}.pub",
-            private_key_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| "Invalid SSH key filename".to_string())?
-        ),
-    );
+    let file_name = private_key_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Invalid SSH key filename".to_string())?;
+
+    let public_key_path = ssh_dir.join(format!("{file_name}.pub"));
+
+    // Inspect the public key without following symbolic links.
+    match std::fs::symlink_metadata(&public_key_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("SSH public key must be a regular file".to_string());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("Failed to inspect public key: {error}"));
+        }
+    }
 
     std::fs::remove_file(&private_key_path)
         .map_err(|error| format!("Failed to delete private key: {error}"))?;
 
-    if public_key_path.exists() {
-        std::fs::remove_file(&public_key_path)
-            .map_err(|error| format!("Failed to delete public key: {error}"))?;
+    match std::fs::remove_file(&public_key_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Private key deleted, but failed to delete public key: {error}"
+            ));
+        }
     }
 
     Ok(())
@@ -3352,7 +3348,6 @@ struct SshServerRecord {
 
 #[derive(Debug, Clone)]
 struct SshConnectionConfig {
-    server_id: String,
     host: String,
     username: String,
     port: u16,
@@ -3369,7 +3364,6 @@ struct SshTestConnectionResult {
 
 fn ssh_connection_config(server: &SshServerRecord) -> SshConnectionConfig {
     SshConnectionConfig {
-        server_id: server.id.clone(),
         host: server.host.clone(),
         username: server.username.clone(),
         port: server.port,
@@ -3984,7 +3978,7 @@ async fn sftp_upload_file(
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     // Open the local file without loading it fully into memory.
     let mut local_file = tokio::fs::File::open(&local_path)
@@ -4106,7 +4100,7 @@ async fn sftp_upload_multiple(
 ) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     if local_paths.is_empty() {
         return Err("Aucun fichier ou dossier sélectionné.".to_string());
@@ -4183,8 +4177,7 @@ async fn sftp_upload_multiple(
             format!("Impossible d'accéder au dossier distant : {error}")
         })?;
 
-    // Collecte les fichiers à transférer et les dossiers nécessaires.
-    // Chaque dossier sélectionné est créé sous son nom dans la destination.
+    // Collects the files to be transferred and the necessary folders. Each folder selected is created under its name in the destination.
     let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
     let mut directories_to_create: Vec<String> = Vec::new();
     let mut total_bytes = 0u64;
@@ -4289,7 +4282,7 @@ async fn sftp_upload_multiple(
         )?;
     }
 
-    // Crée d'abord les dossiers, des parents vers les enfants.
+    // Create the folders first, from parents to children.
     let created_paths: Arc<Mutex<Vec<(String, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
 
@@ -4418,8 +4411,7 @@ async fn sftp_upload_multiple(
             .map(|paths| paths.clone())
             .unwrap_or_default();
 
-        // Les éléments ont été enregistrés dans l'ordre de création.
-        // On les supprime en sens inverse pour supprimer les fichiers avant les dossiers.
+        // The items were saved in the order they were created. We delete them in reverse to remove the files before the folders.
         for (path, is_directory) in paths.iter().rev() {
             if *is_directory {
                 let _ = sftp.remove_dir(path.clone()).await;
@@ -4729,7 +4721,7 @@ async fn sftp_download_multiple(
         atomic::{AtomicU64, Ordering},
         Arc,
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     if remote_paths.is_empty() {
         return Err("Aucun fichier ou dossier sélectionné.".to_string());
@@ -5136,7 +5128,7 @@ async fn sftp_download_multiple(
                     match tokio::fs::remove_file(&local_path).await {
                         Ok(()) => {
                         }
-                        Err(remove_error) => {
+                        Err(_remove_error) => {
                         }
                     }
 
@@ -5156,7 +5148,7 @@ async fn sftp_download_multiple(
     async fn cleanup_created_paths(created_paths: &Arc<Mutex<Vec<PathBuf>>>) {
         let paths = match created_paths.lock() {
             Ok(paths) => paths.clone(),
-            Err(error) => {
+            Err(_error) => {
                 return;
             }
         };
@@ -5174,7 +5166,7 @@ async fn sftp_download_multiple(
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
+                Err(_error) => {
                 }
             }
         }
@@ -5577,7 +5569,6 @@ async fn ssh_connect(
     server_id: String,
     passphrase: Option<String>,
 ) -> Result<String, String> {
-    let command_started = std::time::Instant::now();
 
     let connection = init_database(&app_handle)?;
 
@@ -5637,7 +5628,6 @@ async fn ssh_connect(
         None
     };
 
-    let ssh_connect_started = std::time::Instant::now();
 
     let channel = match tokio::time::timeout(
         Duration::from_secs(connection_timeout_secs),
@@ -6327,14 +6317,34 @@ mod tests {
         assert!(result.max_ms.is_some());
     }
 
+
 #[test]
-    fn tcp_check_local_ssh() {
-        let result = tcp_check("127.0.0.1".to_string(), 22).expect("tcp check failed");
+    fn tcp_check_local_open_port() {
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        // Reserve a local port available.
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("failed to bind local TCP listener");
+
+        let port = listener
+            .local_addr()
+            .expect("failed to get local address")
+            .port();
+
+        // Verifies that the port is detected as open.
+        let result =
+            tcp_check("127.0.0.1".to_string(), port).expect("tcp check failed");
 
         assert_eq!(result.target, "127.0.0.1");
-        assert_eq!(result.port, 22);
+        assert_eq!(result.port, port);
         assert!(result.open);
         assert!(result.connect_time_ms.is_some());
+
+        // Give a short delay before the test ends.
+        thread::sleep(Duration::from_millis(10));
+        drop(listener);
     }
 
 #[test]
@@ -6349,13 +6359,18 @@ mod tests {
 
 #[tokio::test]
 async fn dns_lookup_a_record() {
-    let result = dns_lookup("example.com".to_string(), "A".to_string())
-        .await
-        .expect("DNS lookup failed");
+    let result = dns_lookup(
+        "example.com".to_string(),
+        "A".to_string(),
+        None,
+    )
+    .await
+    .expect("DNS lookup failed");
 
     assert_eq!(result.name, "example.com");
     assert_eq!(result.record_type, "A");
     assert!(!result.records.is_empty());
 }
+
 
 }

@@ -299,7 +299,7 @@ useEffect(() => {
   const [neighborInterfaceFilter, setNeighborInterfaceFilter] = useState("all");
   const [neighborSort, setNeighborSort] = useState<"ip" | "mac" | "state">("ip");
   const [isRefreshingNeighbors, setIsRefreshingNeighbors] = useState(false);
-  const [pingTarget, setPingTarget] = useState("192.168.1.254");
+  const [pingTarget, setPingTarget] = useState("8.8.8.8");
   const [pingResult, setPingResult] = useState<PingResult | null>(null);
   const [globalConnectivity, setGlobalConnectivity] =
     useState<GlobalConnectivityResult | null>(null);
@@ -320,7 +320,7 @@ useEffect(() => {
   const [tcpResult, setTcpResult] = useState<TcpCheckResult | null>(null);
   const [tcpError, setTcpError] = useState("");
   const [isTcpChecking, setIsTcpChecking] = useState(false);
-  const [tracerouteTarget, setTracerouteTarget] = useState("192.168.1.254");
+  const [tracerouteTarget, setTracerouteTarget] = useState("8.8.8.8");
   const [tracerouteResult, setTracerouteResult] = useState<TracerouteHop[]>([]);
   const [tracerouteError, setTracerouteError] = useState("");
   const [isTracerouting, setIsTracerouting] = useState(false);
@@ -335,7 +335,7 @@ useEffect(() => {
   const [dnsLookupResult, setDnsLookupResult] = useState<DnsLookupResult | null>(null);
   const [dnsLookupError, setDnsLookupError] = useState("");
   const [isDnsLookingUp, setIsDnsLookingUp] = useState(false);
-  const [reverseDnsIp, setReverseDnsIp] = useState("192.168.1.254");
+  const [reverseDnsIp, setReverseDnsIp] = useState("8.8.8.8");
   const [reverseDnsResult, setReverseDnsResult] =
   useState<ReverseDnsResult | null>(null);
   const [reverseDnsError, setReverseDnsError] = useState("");
@@ -386,7 +386,7 @@ useEffect(() => {
           dns_info: DnsInfo;
         }>("net_toolbox_initial_data");
 
-        // Ne pas poursuivre si cet effet a été annulé par React StrictMode.
+        // Do not proceed if this effect was canceled by React StrictMode.
         if (cancelled) {
           return;
         }
@@ -395,12 +395,11 @@ useEffect(() => {
         setNeighbors(result.neighbors);
         setDnsInfo(result.dns_info);
 
-        // Les états des adaptateurs sont maintenant en cache.
-        // Charger les interfaces uniquement pour l'effet actif.
+        // Adapter states are now cached. Load interfaces only for the active effect.
         await loadInterfaces();
 
       } else {
-        // Conserver le comportement existant sur les autres systèmes.
+        // Maintain existing behavior on other systems.
         const [neighbors, routes, dnsInfo] = await Promise.all([
           invoke<NetworkNeighborInfo[]>("network_neighbors"),
           invoke<NetworkRouteInfo[]>("network_routes"),
@@ -422,22 +421,22 @@ useEffect(() => {
   };
 
   if (isWindows) {
-    // Windows : collecte groupée, puis chargement des interfaces.
+    // Windows: bulk collection, then interface loading.
     void loadInitialNetworkData();
   } else {
-    // Autres systèmes : conserver le chargement parallèle.
+    // Other systems: keep parallel loading.
     void loadInterfaces();
     void loadInitialNetworkData();
   }
 
-// Actualiser les interfaces réseau toutes les 10 secondes.
+// Refresh network interfaces every 10 seconds.
 const interfacesInterval = window.setInterval(() => {
 if (!cancelled) {
 void loadInterfaces();
 }
 }, 10_000);
 
-// Sous Windows, rafraîchir aussi l'état des adaptateurs toutes les 30 secondes.
+// On Windows, also refresh the adapters' state every 30 seconds.
 const interfaceStatesInterval = isWindows
 ? window.setInterval(async () => {
 if (cancelled) {
@@ -880,7 +879,7 @@ async function handleHttpDiagnostic() {
         type="text"
         value={pingTarget}
         onChange={(event) => setPingTarget(event.target.value)}
-        placeholder="192.168.1.254"
+        placeholder="8.8.8.8"
         className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
       />
 
@@ -1201,7 +1200,7 @@ async function handleHttpDiagnostic() {
         type="text"
         value={tcpTarget}
         onChange={(event) => setTcpTarget(event.target.value)}
-        placeholder="192.168.1.254"
+        placeholder="8.8.8.8"
         className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
       />
 
@@ -1280,7 +1279,7 @@ async function handleHttpDiagnostic() {
         type="text"
         value={tracerouteTarget}
         onChange={(event) => setTracerouteTarget(event.target.value)}
-        placeholder="192.168.1.254"
+        placeholder="8.8.8.8"
         className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
       />
 
@@ -1523,7 +1522,7 @@ async function handleHttpDiagnostic() {
         type="text"
         value={portScanTarget}
         onChange={(event) => setPortScanTarget(event.target.value)}
-        placeholder="192.168.1.42 or hostname"
+        placeholder="IP address or hostname"
         disabled={isPortScanning}
         className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826]"
       />
@@ -1870,7 +1869,7 @@ async function handleHttpDiagnostic() {
       type="text"
       value={reverseDnsIp}
       onChange={(event) => setReverseDnsIp(event.target.value)}
-      placeholder="192.168.1.254"
+      placeholder="8.8.8.8"
       className="min-w-0 flex-1 rounded-md border border-[#3B171D] bg-[#1D0D11] px-3 py-2 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5A5E] focus:border-[#B52636]"
     />
 

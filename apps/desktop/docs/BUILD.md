@@ -101,6 +101,14 @@ pnpm tauri build
 
 Verify the generated installer or application package.
 
+For the current Windows build (`0.1.0`), the generated files are:
+
+- **MSI installer:** `src-tauri/target/release/bundle/msi/nexus_0.1.0_x64_en-US.msi`
+- **NSIS installer:** `src-tauri/target/release/bundle/nsis/nexus_0.1.0_x64-setup.exe`
+- **Application executable:** `src-tauri/target/release/nexus.exe`
+
+These paths are relative to the `apps/desktop/` directory. File names may change when the application version or bundle configuration changes.
+
 Functional testing should include:
 
 - Application startup and shutdown.

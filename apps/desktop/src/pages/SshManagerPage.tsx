@@ -57,7 +57,7 @@ const INITIAL_SERVERS: SshServer[] = [
   {
     id: 'demo-01',
     name: 'Web Server',
-    host: '192.168.1.20',
+    host: '192.168.1.1',
     username: 'root',
     port: 22,
     authenticationMethod: 'ssh-agent',
@@ -1153,7 +1153,7 @@ const downloadSelectedSftpEntries = async () => {
     setSftpTransferCancelled(false);
     setSftpTransferProgress(null);
 
-    // Choisir le dossier local de destination.
+    // Choose the destination local folder.
     const localDirectory = await open({
       title: 'Choisir le dossier de destination',
       directory: true,
@@ -1164,7 +1164,7 @@ const downloadSelectedSftpEntries = async () => {
       return;
     }
 
-    // Construire les chemins distants complets.
+    // Build the complete remote paths.
     const remotePaths = selectedSftpEntries.map((name) =>
       sftpCurrentPath === '/'
         ? `/${name}`
@@ -1326,7 +1326,7 @@ const sftpPathSegments =
                 type="text"
                 value={host}
                 onChange={(event) => setHost(event.target.value)}
-                placeholder="192.168.1.20"
+                placeholder="192.168.1.1"
                 disabled={isSavingServer}
                 className="w-full rounded-md border border-[#3B171D] bg-[#1D0D11] px-4 py-3 font-mono text-sm text-[#EEE5E6] outline-none placeholder:text-[#6F5B5F] focus:border-[#8F1826] disabled:cursor-not-allowed disabled:opacity-50"
               />
@@ -1960,10 +1960,6 @@ const sftpPathSegments =
                         </button>
                       </div>
                     )}
-
-
-
-
 
                     {activeSessionView === 'terminal' && (
                     <SshTerminal

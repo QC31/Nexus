@@ -37,3 +37,7 @@ Thumbs.db
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
+
+# Local diagnostic output and source backups
+/apps/desktop/nettoolbox-output.json
+/apps/desktop/src-tauri/src/lib.rs.backup

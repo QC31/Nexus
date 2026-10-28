@@ -7,19 +7,6 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::decode_secret_key;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SshAuthMethod {
-    SshAgent,
-    PrivateKey,
-    Password,
-}
-
-pub trait SshAuthenticationProvider: Send + Sync {
-    fn method(&self) -> SshAuthMethod;
-
-    fn is_available(&self) -> Result<bool, String>;
-}
-
 pub struct SshAgentProvider;
 
 impl SshAgentProvider {
@@ -58,34 +45,6 @@ impl SshAgentProvider {
                 "SSH Agent is not supported on this platform"
                     .to_string(),
             )
-        }
-    }
-
-    pub async fn identities(
-        &self,
-    ) -> Result<Vec<AgentIdentity>, String> {
-        let mut agent = self.connect().await?;
-
-        match &mut agent {
-            #[cfg(unix)]
-            SshAgentClient::Unix(agent) => agent
-                .request_identities()
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Failed to query SSH Agent identities: {error}"
-                    )
-                }),
-
-            #[cfg(windows)]
-            SshAgentClient::NamedPipe(agent) => agent
-                .request_identities()
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Failed to query SSH Agent identities: {error}"
-                    )
-                }),
         }
     }
 
@@ -173,29 +132,6 @@ impl SshAgentProvider {
             "SSH Agent authentication was rejected by the server"
                 .to_string(),
         )
-    }
-}
-
-impl SshAuthenticationProvider for SshAgentProvider {
-    fn method(&self) -> SshAuthMethod {
-        SshAuthMethod::SshAgent
-    }
-
-    fn is_available(&self) -> Result<bool, String> {
-        #[cfg(unix)]
-        {
-            Ok(std::env::var_os("SSH_AUTH_SOCK").is_some())
-        }
-
-        #[cfg(windows)]
-        {
-            Ok(true)
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(false)
-        }
     }
 }
 
@@ -298,16 +234,6 @@ impl PrivateKeyProvider {
                     "SSH private key authentication failed: {error}"
                 )
             })
-    }
-}
-
-impl SshAuthenticationProvider for PrivateKeyProvider {
-    fn method(&self) -> SshAuthMethod {
-        SshAuthMethod::PrivateKey
-    }
-
-    fn is_available(&self) -> Result<bool, String> {
-        Ok(!self.key_path.trim().is_empty())
     }
 }
 
