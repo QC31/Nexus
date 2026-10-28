@@ -678,11 +678,9 @@ fn ping_host(target: String) -> Result<PingResult, String> {
 
                 if let Some(value) = parts.get(2) {
                     packet_loss = value
-                        .trim()
-                        .trim_end_matches('%')
                         .split_whitespace()
-                        .next()
-                        .and_then(|value| value.parse::<f64>().ok())
+                        .find(|part| part.ends_with('%'))
+                        .and_then(|part| part.trim_end_matches('%').parse::<f64>().ok())
                         .unwrap_or(packet_loss);
                 }
             }
@@ -1458,6 +1456,12 @@ async fn refresh_interface_states() -> Result<(), String> {
     .await
     .map_err(|error| error.to_string())?;
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+async fn refresh_interface_states() -> Result<(), String> {
     Ok(())
 }
 
@@ -2928,6 +2932,12 @@ if let Ok(guard) = cache.lock() {
     }
 
     Ok(data)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+async fn net_toolbox_initial_data() -> Result<NetToolBoxInitialData, String> {
+    Err("Cette commande est réservée à Windows".to_string())
 }
 
 fn ssh_credential_entry(server_id: &str) -> Result<Entry, String> {
