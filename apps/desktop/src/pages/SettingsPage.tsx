@@ -348,7 +348,7 @@ async function saveSetting(key: string, value: string) {
             <div className="mt-4">
               <p className="text-sm font-medium">NEXUS</p>
               <p className="mt-1 font-mono text-xs text-[#9D8589]">
-                Network Operations Suite · v0.1.0
+                Network Operations Suite · v0.1.1
               </p>
               <p className="mt-3 text-xs text-[#9D8589]">
                 Desktop application built with Tauri, React, and Rust.
