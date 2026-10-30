@@ -3100,45 +3100,48 @@ fn list_ssh_keys() -> Result<Vec<SshKeyInfo>, String> {
             None => continue,
         };
 
-        if file_name.ends_with(".pub") {
+        if file_name.ends_with(".pub")
+            || file_name == "config"
+            || file_name.starts_with("known_hosts")
+        {
             continue;
         }
 
-        let key_type = if file_name.contains("ed25519") {
-            "ED25519"
-        } else if file_name.contains("rsa") {
-            "RSA"
-        } else if file_name.contains("ecdsa") {
-            "ECDSA"
-        } else if file_name.contains("dsa") {
-            "DSA"
-        } else {
-            continue;
-        };
-
         let public_key_path = path.with_file_name(format!("{file_name}.pub"));
 
-        let fingerprint = if public_key_path.exists() {
-            match std::fs::read_to_string(&public_key_path) {
-                Ok(public_key) => match ssh_key::PublicKey::from_openssh(public_key.trim()) {
-                    Ok(key) => Some(key.fingerprint(Default::default()).to_string()),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            }
-        } else {
-            None
+        if !public_key_path.is_file() {
+            continue;
+        }
+
+        let public_key = match std::fs::read_to_string(&public_key_path) {
+            Ok(content) => content,
+            Err(_) => continue,
         };
+
+        let key = match ssh_key::PublicKey::from_openssh(public_key.trim()) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+
+        let key_type = if key.algorithm().is_ed25519() {
+            "ED25519"
+        } else if key.algorithm().is_rsa() {
+            "RSA"
+        } else if key.algorithm().is_ecdsa() {
+            "ECDSA"
+        } else if key.algorithm().is_dsa() {
+            "DSA"
+        } else {
+            "UNKNOWN"
+        };
+
+        let fingerprint = Some(key.fingerprint(Default::default()).to_string());
 
         keys.push(SshKeyInfo {
             name: file_name.to_string(),
             path: path.to_string_lossy().to_string(),
             key_type: key_type.to_string(),
-            public_key_path: if public_key_path.exists() {
-                Some(public_key_path.to_string_lossy().to_string())
-            } else {
-                None
-            },
+            public_key_path: Some(public_key_path.to_string_lossy().to_string()),
             fingerprint,
         });
     }
